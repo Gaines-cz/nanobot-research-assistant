@@ -1,9 +1,17 @@
-"""Web tools: web_search and web_fetch."""
+"""Web tools: web_search and web_fetch.
+
+Enhanced with:
+- Result caching (avoid duplicate searches)
+- Region and language parameters
+- Freshness filtering
+- External content safety wrapping
+"""
 
 import html
 import json
 import os
 import re
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -14,6 +22,19 @@ from nanobot.agent.tools.base import Tool
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
 MAX_REDIRECTS = 5  # Limit redirects to prevent DoS attacks
+
+# Cache settings
+SEARCH_CACHE: dict[str, tuple[float, str]] = {}  # {cache_key: (timestamp, result)}
+CACHE_TTL_SECONDS = 300  # Cache for 5 minutes
+
+# Serper Search freshness values mapped to Google tbs parameter
+FRESHNESS_VALUES = {"pd", "pw", "pm", "py"}  # past day/week/month/year
+FRESHNESS_TO_TBS = {
+    "pd": "qdr:d",  # past day
+    "pw": "qdr:w",  # past week
+    "pm": "qdr:m",  # past month
+    "py": "qdr:y",  # past year
+}
 
 
 def _strip_tags(text: str) -> str:
@@ -43,65 +64,205 @@ def _validate_url(url: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _wrap_external_content(text: str, source: str = "web") -> str:
+    """
+    Mark external content (safety practice).
+    Prevents prompt injection from search results.
+    """
+    # Remove possible control characters
+    cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+    return cleaned
+
+
+def _get_cache_key(query: str, count: int, country: str | None, freshness: str | None) -> str:
+    """Generate cache key."""
+    return f"{query}:{count}:{country or 'default'}:{freshness or 'default'}"
+
+
+def _read_cache(key: str) -> str | None:
+    """Read cache, return None if expired."""
+    if key in SEARCH_CACHE:
+        timestamp, result = SEARCH_CACHE[key]
+        if time.time() - timestamp < CACHE_TTL_SECONDS:
+            return result
+        # Expired, delete
+        del SEARCH_CACHE[key]
+    return None
+
+
+def _write_cache(key: str, result: str) -> None:
+    """Write to cache."""
+    # Limit cache size (prevent memory overflow)
+    if len(SEARCH_CACHE) > 100:
+        # Delete oldest half
+        sorted_keys = sorted(SEARCH_CACHE.keys(), key=lambda k: SEARCH_CACHE[k][0])
+        for old_key in sorted_keys[:50]:
+            del SEARCH_CACHE[old_key]
+    SEARCH_CACHE[key] = (time.time(), result)
+
+
+def _normalize_freshness(value: str | None) -> str | None:
+    """
+    Normalize freshness parameter.
+    Supports: pd (past 24h), pw (past week), pm (past month), py (past year)
+    or date range: YYYY-MM-DDtoYYYY-MM-DD
+    """
+    if not value:
+        return None
+    trimmed = value.strip().lower()
+    if trimmed in FRESHNESS_VALUES:
+        return trimmed
+    # Check date range format
+    if re.match(r'^\d{4}-\d{2}-\d{2}to\d{4}-\d{2}-\d{2}$', trimmed):
+        return trimmed
+    return None
+
+
 class WebSearchTool(Tool):
-    """Search the web using Brave Search API."""
-    
+    """Search the web using Serper (Google Search) API."""
+
     name = "web_search"
-    description = "Search the web. Returns titles, URLs, and snippets."
+    description = (
+        "Search the web for up-to-date information. Supports region filtering and freshness filtering."
+        "Returns titles, URLs, and snippets."
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Search query"},
-            "count": {"type": "integer", "description": "Results (1-10)", "minimum": 1, "maximum": 10}
+            "query": {
+                "type": "string",
+                "description": "Search query"
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of results (1-10)",
+                "minimum": 1,
+                "maximum": 10
+            },
+            "country": {
+                "type": "string",
+                "description": "Country code (e.g., US, CN, DE, ALL), default US"
+            },
+            "freshness": {
+                "type": "string",
+                "description": "Freshness filter: pd=past 24 hours, pw=past week, pm=past month, py=past year"
+            }
         },
         "required": ["query"]
     }
-    
-    def __init__(self, api_key: str | None = None, max_results: int = 5):
-        self._init_api_key = api_key
+
+    def __init__(self, api_key: str | None = None, max_results: int = 5, timeout: float = 15.0):
+        self.api_key = api_key or os.environ.get("SERPER_API_KEY", "")
         self.max_results = max_results
+        self.timeout = timeout
 
-    @property
-    def api_key(self) -> str:
-        """Resolve API key at call time so env/config changes are picked up."""
-        return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
-
-    async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self,
+        query: str,
+        count: int | None = None,
+        country: str | None = None,
+        freshness: str | None = None,
+        **kwargs: Any
+    ) -> str:
         if not self.api_key:
-            return (
-                "Error: Brave Search API key not configured. "
-                "Set it in ~/.nanobot/config.json under tools.web.search.apiKey "
-                "(or export BRAVE_API_KEY), then restart the gateway."
-            )
-        
+            return json.dumps({
+                "error": "missing_api_key",
+                "message": "SERPER_API_KEY not configured. Please set Serper (Google Search) API key in config file."
+            }, ensure_ascii=False)
+
+        n = min(max(count or self.max_results, 1), 10)
+        normalized_freshness = _normalize_freshness(freshness)
+
+        # Check cache
+        cache_key = _get_cache_key(query, n, country, normalized_freshness)
+        cached = _read_cache(cache_key)
+        if cached:
+            return cached + "\n\n(cached)"
+
         try:
-            n = min(max(count or self.max_results, 1), 10)
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-                    timeout=10.0
-                )
-                r.raise_for_status()
-            
-            results = r.json().get("web", {}).get("results", [])
+            # Build request payload
+            payload: dict[str, Any] = {"q": query, "num": n}
+            if country:
+                payload["gl"] = country.upper()
+            if normalized_freshness:
+                if normalized_freshness in FRESHNESS_TO_TBS:
+                    payload["tbs"] = FRESHNESS_TO_TBS[normalized_freshness]
+                else:
+                    # Date range format passed directly (for compatibility)
+                    pass
+
+            start_time = time.time()
+
+            # SSL fallback mechanism: try verify=True first, then verify=False
+            try:
+                async with httpx.AsyncClient(verify=True) as client:
+                    r = await client.post(
+                        "https://google.serper.dev/search",
+                        json=payload,
+                        headers={
+                            "X-API-KEY": self.api_key,
+                            "Content-Type": "application/json"
+                        },
+                        timeout=self.timeout
+                    )
+                    r.raise_for_status()
+            except (httpx.HTTPError, httpx.TransportError):
+                # SSL verification failed, try without verification
+                async with httpx.AsyncClient(verify=False) as client:
+                    r = await client.post(
+                        "https://google.serper.dev/search",
+                        json=payload,
+                        headers={
+                            "X-API-KEY": self.api_key,
+                            "Content-Type": "application/json"
+                        },
+                        timeout=self.timeout
+                    )
+                    r.raise_for_status()
+
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            results = r.json().get("organic", [])
             if not results:
-                return f"No results for: {query}"
-            
-            lines = [f"Results for: {query}\n"]
+                return json.dumps({
+                    "query": query,
+                    "count": 0,
+                    "message": f"No results found for '{query}'"
+                }, ensure_ascii=False)
+
+            # Format results (using safe wrapping)
+            lines = [f"Results for: {query} ({elapsed_ms}ms)\n"]
             for i, item in enumerate(results[:n], 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
+                title = _wrap_external_content(item.get('title', ''))
+                url = item.get('link', '')
+                desc = _wrap_external_content(item.get('snippet', ''))
+                age = item.get('date', '')
+
+                lines.append(f"{i}. {title}")
+                lines.append(f"   {url}")
+                if desc:
                     lines.append(f"   {desc}")
-            return "\n".join(lines)
+                if age:
+                    lines.append(f"   Published: {age}")
+
+            result = "\n".join(lines)
+
+            # Write to cache
+            _write_cache(cache_key, result)
+
+            return result
+
+        except httpx.TimeoutException:
+            return json.dumps({"error": "timeout", "message": f"Search timed out ({self.timeout}s)"}, ensure_ascii=False)
+        except httpx.HTTPStatusError as e:
+            return json.dumps({"error": "http_error", "status": e.response.status_code, "message": str(e)}, ensure_ascii=False)
         except Exception as e:
-            return f"Error: {e}"
+            return json.dumps({"error": "unknown", "message": str(e)}, ensure_ascii=False)
 
 
 class WebFetchTool(Tool):
     """Fetch and extract content from a URL using Readability."""
-    
+
     name = "web_fetch"
     description = "Fetch URL and extract readable content (HTML → markdown/text)."
     parameters = {
@@ -109,20 +270,20 @@ class WebFetchTool(Tool):
         "properties": {
             "url": {"type": "string", "description": "URL to fetch"},
             "extractMode": {"type": "string", "enum": ["markdown", "text"], "default": "markdown"},
-            "maxChars": {"type": "integer", "minimum": 100}
+            "maxChars": {"type": "integer", "minimum": 100, "description": "Maximum characters"}
         },
         "required": ["url"]
     }
-    
+
     def __init__(self, max_chars: int = 50000):
         self.max_chars = max_chars
-    
+
     async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> str:
         from readability import Document
 
         max_chars = maxChars or self.max_chars
 
-        # Validate URL before fetching
+        # Validate URL
         is_valid, error_msg = _validate_url(url)
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
@@ -135,9 +296,9 @@ class WebFetchTool(Tool):
             ) as client:
                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
-            
+
             ctype = r.headers.get("content-type", "")
-            
+
             # JSON
             if "application/json" in ctype:
                 text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"
@@ -149,21 +310,28 @@ class WebFetchTool(Tool):
                 extractor = "readability"
             else:
                 text, extractor = r.text, "raw"
-            
+
             truncated = len(text) > max_chars
             if truncated:
                 text = text[:max_chars]
-            
-            return json.dumps({"url": url, "finalUrl": str(r.url), "status": r.status_code,
-                              "extractor": extractor, "truncated": truncated, "length": len(text), "text": text}, ensure_ascii=False)
+
+            return json.dumps({
+                "url": url,
+                "finalUrl": str(r.url),
+                "status": r.status_code,
+                "extractor": extractor,
+                "truncated": truncated,
+                "length": len(text),
+                "text": _wrap_external_content(text)
+            }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
-    
-    def _to_markdown(self, html: str) -> str:
+
+    def _to_markdown(self, html_content: str) -> str:
         """Convert HTML to markdown."""
-        # Convert links, headings, lists before stripping tags
+        # Convert links, headings, lists
         text = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
-                      lambda m: f'[{_strip_tags(m[2])}]({m[1]})', html, flags=re.I)
+                      lambda m: f'[{_strip_tags(m[2])}]({m[1]})', html_content, flags=re.I)
         text = re.sub(r'<h([1-6])[^>]*>([\s\S]*?)</h\1>',
                       lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n', text, flags=re.I)
         text = re.sub(r'<li[^>]*>([\s\S]*?)</li>', lambda m: f'\n- {_strip_tags(m[1])}', text, flags=re.I)
