@@ -1059,6 +1059,68 @@ def rag_refresh():
     console.print(f"\nTotal: {stats['documents']} documents, {stats['chunks']} chunks")
 
 
+@rag_app.command("rebuild")
+def rag_rebuild():
+    """Delete existing index and rebuild from scratch."""
+    from nanobot.config.loader import load_config
+    from nanobot.rag import DocumentStore, SentenceTransformerEmbeddingProvider
+
+    config = load_config()
+    workspace = config.workspace_path
+    rag_config = config.tools.rag
+
+    console.print(f"{__logo__} Rebuilding RAG index...\n")
+
+    if not rag_config.enabled:
+        console.print("[yellow]RAG is disabled in config[/yellow]")
+        raise typer.Exit(1)
+
+    docs_dir = workspace / "docs"
+    db_path = workspace / "rag" / "docs.db"
+
+    console.print(f"Workspace: {workspace}")
+    console.print(f"Docs dir: {docs_dir}")
+    console.print(f"Database: {db_path}\n")
+
+    # Delete existing database if it exists
+    if db_path.exists():
+        console.print(f"[red]Deleting existing index: {db_path}[/red]")
+        if not typer.confirm("Continue?"):
+            console.print("Cancelled.")
+            raise typer.Exit(0)
+        db_path.unlink()
+        console.print("[green]✓[/green] Deleted existing index\n")
+
+    # Rebuild index
+    try:
+        embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
+        store = DocumentStore(db_path, embedding_provider)
+    except ImportError as e:
+        console.print(f"[red]RAG dependencies not installed: {e}[/red]")
+        console.print("Install with: pip install 'nanobot-ai[rag]'")
+        raise typer.Exit(1)
+
+    import asyncio
+
+    async def scan():
+        return await store.scan_and_index(
+            docs_dir,
+            chunk_size=rag_config.chunk_size,
+            chunk_overlap=rag_config.chunk_overlap,
+        )
+
+    with console.status("Rebuilding index...", spinner="dots"):
+        stats = asyncio.run(scan())
+
+    console.print(f"[green]✓[/green] RAG rebuild complete!")
+    console.print(f"  Added: {stats['added']}")
+    console.print(f"  Updated: {stats['updated']}")
+    console.print(f"  Deleted: {stats['deleted']}")
+
+    stats = store.get_stats()
+    console.print(f"\nTotal: {stats['documents']} documents, {stats['chunks']} chunks")
+
+
 @rag_app.command("status")
 def rag_status():
     """Show RAG index status and statistics."""
