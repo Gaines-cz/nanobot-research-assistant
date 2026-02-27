@@ -17,6 +17,7 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.rag import SearchKnowledgeTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
@@ -27,7 +28,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, RAGConfig
     from nanobot.cron.service import CronService
 
 
@@ -60,8 +61,9 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        rag_config: RAGConfig | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, RAGConfig
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
@@ -75,6 +77,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.rag_config = rag_config or RAGConfig()
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -101,6 +104,7 @@ class AgentLoop:
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
+        self._rag_initialized = False
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -120,6 +124,22 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        # Register RAG tool if enabled
+        if self.rag_config.enabled:
+            try:
+                retrieve_tool = SearchKnowledgeTool(
+                    workspace=self.workspace,
+                    chunk_size=self.rag_config.chunk_size,
+                    chunk_overlap=self.rag_config.chunk_overlap,
+                    embedding_model=self.rag_config.embedding_model,
+                )
+                self.tools.register(retrieve_tool)
+                self._retrieve_tool = retrieve_tool
+            except ImportError as e:
+                logger.warning("RAG dependencies not installed, skipping retrieve tool: {}", e)
+                self._retrieve_tool = None
+        else:
+            self._retrieve_tool = None
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -142,6 +162,32 @@ class AgentLoop:
                 self._mcp_stack = None
         finally:
             self._mcp_connecting = False
+
+    async def _init_rag(self) -> None:
+        """Initialize RAG and scan documents on first use."""
+        if self._rag_initialized:
+            return
+        if not self._retrieve_tool:
+            return
+        if not self.rag_config.auto_scan_on_startup:
+            self._rag_initialized = True
+            return
+
+        self._rag_initialized = True
+        try:
+            logger.info("Scanning documents for RAG...")
+            stats = await self._retrieve_tool.scan_and_index()
+            total = stats["added"] + stats["updated"]
+            if total > 0:
+                logger.info(
+                    "RAG scan complete: +{} updated, -{} deleted",
+                    stats["added"] + stats["updated"],
+                    stats["deleted"],
+                )
+            else:
+                logger.info("RAG scan complete: no changes")
+        except Exception as e:
+            logger.error("Failed to scan documents for RAG: {}", e)
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -248,6 +294,7 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        await self._init_rag()
         logger.info("Agent loop started")
 
         while self._running:
@@ -496,6 +543,7 @@ class AgentLoop:
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
+        await self._init_rag()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""

@@ -295,6 +295,17 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # Seconds before a tool call is cancelled
 
 
+class RAGConfig(Base):
+    """RAG (Retrieval-Augmented Generation) configuration."""
+
+    enabled: bool = True
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    top_k: int = 5
+    embedding_model: str = "all-MiniLM-L6-v2"
+    auto_scan_on_startup: bool = True  # Auto-scan docs on startup
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
@@ -302,6 +313,7 @@ class ToolsConfig(Base):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    rag: RAGConfig = Field(default_factory=RAGConfig)
 
 
 class Config(BaseSettings):

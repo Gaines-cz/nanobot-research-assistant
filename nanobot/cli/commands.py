@@ -319,6 +319,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        rag_config=config.tools.rag,
     )
     
     # Set cron callback (needs agent)
@@ -475,6 +476,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        rag_config=config.tools.rag,
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -965,6 +967,7 @@ def cron_run(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        rag_config=config.tools.rag,
     )
 
     store_path = get_data_dir() / "cron" / "jobs.json"
@@ -993,6 +996,123 @@ def cron_run(
             _print_agent_response(result_holder[0], render_markdown=True)
     else:
         console.print(f"[red]Failed to run job {job_id}[/red]")
+
+
+# ============================================================================
+# RAG Commands
+# ============================================================================
+
+
+rag_app = typer.Typer(help="Manage RAG (document retrieval)")
+app.add_typer(rag_app, name="rag")
+
+
+@rag_app.command("refresh")
+def rag_refresh():
+    """Refresh RAG document index - scan for new/changed/deleted documents."""
+    from nanobot.config.loader import load_config
+    from nanobot.rag import DocumentStore, SentenceTransformerEmbeddingProvider
+
+    config = load_config()
+    workspace = config.workspace_path
+    rag_config = config.tools.rag
+
+    console.print(f"{__logo__} Refreshing RAG index...\n")
+
+    if not rag_config.enabled:
+        console.print("[yellow]RAG is disabled in config[/yellow]")
+        raise typer.Exit(1)
+
+    docs_dir = workspace / "docs"
+    db_path = workspace / "rag" / "docs.db"
+
+    console.print(f"Workspace: {workspace}")
+    console.print(f"Docs dir: {docs_dir}")
+    console.print(f"Database: {db_path}\n")
+
+    try:
+        embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
+        store = DocumentStore(db_path, embedding_provider)
+    except ImportError as e:
+        console.print(f"[red]RAG dependencies not installed: {e}[/red]")
+        console.print("Install with: pip install 'nanobot-ai[rag]'")
+        raise typer.Exit(1)
+
+    import asyncio
+
+    async def scan():
+        return await store.scan_and_index(
+            docs_dir,
+            chunk_size=rag_config.chunk_size,
+            chunk_overlap=rag_config.chunk_overlap,
+        )
+
+    with console.status("Scanning documents...", spinner="dots"):
+        stats = asyncio.run(scan())
+
+    console.print(f"[green]✓[/green] RAG refresh complete!")
+    console.print(f"  Added: {stats['added']}")
+    console.print(f"  Updated: {stats['updated']}")
+    console.print(f"  Deleted: {stats['deleted']}")
+
+    stats = store.get_stats()
+    console.print(f"\nTotal: {stats['documents']} documents, {stats['chunks']} chunks")
+
+
+@rag_app.command("status")
+def rag_status():
+    """Show RAG index status and statistics."""
+    from nanobot.config.loader import load_config
+    from nanobot.rag import DocumentStore
+
+    config = load_config()
+    workspace = config.workspace_path
+    rag_config = config.tools.rag
+
+    console.print(f"{__logo__} RAG Status\n")
+
+    if not rag_config.enabled:
+        console.print("[yellow]RAG is disabled in config[/yellow]")
+    else:
+        console.print("RAG: [green]enabled[/green]")
+        console.print(f"Embedding model: {rag_config.embedding_model}")
+        console.print(f"Chunk size: {rag_config.chunk_size} (overlap: {rag_config.chunk_overlap})")
+
+    docs_dir = workspace / "docs"
+    db_path = workspace / "rag" / "docs.db"
+
+    console.print(f"\nDocs dir: {docs_dir}")
+    if docs_dir.exists():
+        count = sum(1 for _ in docs_dir.rglob("*") if _.is_file() and not _.name.startswith("."))
+        console.print(f"  Files in docs: {count}")
+    else:
+        console.print("  [yellow]Docs directory not found[/yellow]")
+
+    console.print(f"Database: {db_path}")
+    if db_path.exists():
+        console.print(f"  Size: {db_path.stat().st_size / 1024 / 1024:.2f} MB")
+    else:
+        console.print("  [yellow]Database not found[/yellow]")
+
+    if not rag_config.enabled or not db_path.exists():
+        raise typer.Exit(0)
+
+    try:
+        # No need to load embedding provider for stats
+        store = DocumentStore(db_path)
+        stats = store.get_stats()
+
+        console.print("\n[bold]Index Statistics[/bold]")
+        console.print(f"  Documents: {stats['documents']}")
+        console.print(f"  Chunks: {stats['chunks']}")
+
+        by_type = stats.get('by_file_type', {})
+        if by_type:
+            console.print("  By type:")
+            for ft, count in by_type.items():
+                console.print(f"    {ft}: {count}")
+    except Exception as e:
+        console.print(f"\n[yellow]Could not load database: {e}[/yellow]")
 
 
 # ============================================================================
