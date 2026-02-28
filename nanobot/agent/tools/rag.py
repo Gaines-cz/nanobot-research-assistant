@@ -1,10 +1,18 @@
 """RAG retrieve tool."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+
+from loguru import logger
 
 from nanobot.agent.tools.base import Tool
-from nanobot.rag import DocumentStore, SearchResult, SentenceTransformerEmbeddingProvider
+from nanobot.config.schema import RAGConfig
+from nanobot.rag import (
+    DocumentStore,
+    SearchResult,
+    SearchResultWithContext,
+    SentenceTransformerEmbeddingProvider,
+)
 
 
 class SearchKnowledgeTool(Tool):
@@ -40,11 +48,13 @@ class SearchKnowledgeTool(Tool):
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
         embedding_model: str = "all-MiniLM-L6-v2",
+        rag_config: Optional[RAGConfig] = None,
     ):
         self.workspace = workspace
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.embedding_model = embedding_model
+        self.rag_config = rag_config or RAGConfig()
 
         self._doc_store: DocumentStore | None = None
         self._docs_dir: Path | None = None
@@ -61,8 +71,10 @@ class SearchKnowledgeTool(Tool):
         self._docs_dir.mkdir(parents=True, exist_ok=True)
 
         db_path = self._rag_dir / "docs.db"
+
+        # Don't delete database! Use existing one
         embedding_provider = SentenceTransformerEmbeddingProvider(self.embedding_model)
-        self._doc_store = DocumentStore(db_path, embedding_provider)
+        self._doc_store = DocumentStore(db_path, embedding_provider, self.rag_config)
 
     async def scan_and_index(self) -> dict[str, int]:
         """Scan and index documents in the docs directory."""
@@ -76,10 +88,19 @@ class SearchKnowledgeTool(Tool):
         )
 
     async def execute(self, query: str, top_k: int = 5) -> str:
-        """Execute the retrieve tool."""
+        """Execute the retrieve tool using the new advanced search flow."""
         self._ensure_initialized()
         assert self._doc_store is not None
 
+        # Try advanced search first
+        try:
+            advanced_results = await self._doc_store.search_advanced(query)
+            if advanced_results:
+                return self._format_advanced_results(query, advanced_results)
+        except Exception as e:
+            logger.warning("Advanced search failed, falling back to basic search: {}", e)
+
+        # Fallback to basic search
         results = await self._doc_store.search(query, top_k=top_k)
 
         if not results:
@@ -98,14 +119,31 @@ class SearchKnowledgeTool(Tool):
         lines = [f"Results for \"{query}\":", ""]
 
         for i, result in enumerate(results, 1):
-            # Truncate content if too long
             content = result.content
             if len(content) > 500:
                 content = content[:497] + "..."
-            # Escape quotes
             content = content.replace('"', '\\"')
 
             lines.append(f"[{i}] {result.filename} (score: {result.score:.2f}, {result.source})")
+            lines.append(f'"{content}"')
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _format_advanced_results(self, query: str, results: list[SearchResultWithContext]) -> str:
+        """Format advanced search results with context."""
+        lines = [f"Results for \"{query}\":", ""]
+
+        for i, result in enumerate(results, 1):
+            content = result.combined_content
+            if len(content) > 800:
+                content = content[:797] + "..."
+            content = content.replace('"', '\\"')
+
+            doc_title = result.document.title or result.document.filename
+            lines.append(f"[{i}] {doc_title} (score: {result.final_score:.2f})")
+            if result.chunk.section_title:
+                lines.append(f"  Section: {result.chunk.section_title}")
             lines.append(f'"{content}"')
             lines.append("")
 
@@ -116,3 +154,15 @@ class SearchKnowledgeTool(Tool):
         self._ensure_initialized()
         assert self._doc_store is not None
         return self._doc_store.get_stats()
+
+    def is_vector_enabled(self) -> bool:
+        """Check if vector search is enabled."""
+        self._ensure_initialized()
+        assert self._doc_store is not None
+        return self._doc_store.is_vector_enabled()
+
+    def close(self) -> None:
+        """Close the document store connection."""
+        if self._doc_store is not None:
+            self._doc_store.close()
+            self._doc_store = None

@@ -1032,7 +1032,7 @@ def rag_refresh():
 
     try:
         embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
-        store = DocumentStore(db_path, embedding_provider)
+        store = DocumentStore(db_path, embedding_provider, rag_config)
     except ImportError as e:
         console.print(f"[red]RAG dependencies not installed: {e}[/red]")
         console.print("Install with: pip install 'nanobot-ai[rag]'")
@@ -1057,6 +1057,10 @@ def rag_refresh():
 
     stats = store.get_stats()
     console.print(f"\nTotal: {stats['documents']} documents, {stats['chunks']} chunks")
+    vector_status = "[green]enabled[/green]" if stats.get('vector_enabled', False) else "[yellow]disabled[/yellow]"
+    console.print(f"Vector search: {vector_status}")
+
+    store.close()
 
 
 @rag_app.command("rebuild")
@@ -1094,7 +1098,7 @@ def rag_rebuild():
     # Rebuild index
     try:
         embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
-        store = DocumentStore(db_path, embedding_provider)
+        store = DocumentStore(db_path, embedding_provider, rag_config)
     except ImportError as e:
         console.print(f"[red]RAG dependencies not installed: {e}[/red]")
         console.print("Install with: pip install 'nanobot-ai[rag]'")
@@ -1119,6 +1123,10 @@ def rag_rebuild():
 
     stats = store.get_stats()
     console.print(f"\nTotal: {stats['documents']} documents, {stats['chunks']} chunks")
+    vector_status = "[green]enabled[/green]" if stats.get('vector_enabled', False) else "[yellow]disabled[/yellow]"
+    console.print(f"Vector search: {vector_status}")
+
+    store.close()
 
 
 @rag_app.command("status")
@@ -1145,7 +1153,11 @@ def rag_status():
 
     console.print(f"\nDocs dir: {docs_dir}")
     if docs_dir.exists():
-        count = sum(1 for _ in docs_dir.rglob("*") if _.is_file() and not _.name.startswith("."))
+        # Only count supported document types
+        SUPPORTED_EXTENSIONS = {".pdf", ".md", ".markdown", ".docx", ".doc", ".txt"}
+        count = sum(1 for _ in docs_dir.rglob("*")
+                      if _.is_file() and not _.name.startswith(".")
+                      and _.suffix.lower() in SUPPORTED_EXTENSIONS)
         console.print(f"  Files in docs: {count}")
     else:
         console.print("  [yellow]Docs directory not found[/yellow]")
@@ -1160,8 +1172,16 @@ def rag_status():
         raise typer.Exit(0)
 
     try:
-        # No need to load embedding provider for stats
-        store = DocumentStore(db_path)
+        # Try to load with embedding provider if possible to check vector status
+        store = None
+        try:
+            from nanobot.rag import SentenceTransformerEmbeddingProvider
+            embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
+            store = DocumentStore(db_path, embedding_provider, rag_config)
+        except (ImportError, Exception):
+            # Fall back to no embedding provider
+            store = DocumentStore(db_path)
+
         stats = store.get_stats()
 
         console.print("\n[bold]Index Statistics[/bold]")
@@ -1173,8 +1193,76 @@ def rag_status():
             console.print("  By type:")
             for ft, count in by_type.items():
                 console.print(f"    {ft}: {count}")
+
+        vector_enabled = stats.get('vector_enabled', False)
+        vector_status = "[green]enabled[/green]" if vector_enabled else "[yellow]disabled[/yellow]"
+        console.print(f"\n[bold]Search Capabilities[/bold]")
+        console.print(f"  Vector search: {vector_status}")
+        if not vector_enabled:
+            console.print(f"  Full-text search: [green]enabled[/green]")
+
+        store.close()
     except Exception as e:
         console.print(f"\n[yellow]Could not load database: {e}[/yellow]")
+
+
+@rag_app.command("search")
+def rag_search(
+    query: str = typer.Argument(..., help="Search query"),
+):
+    """Search indexed documents using semantic search."""
+    from nanobot.config.loader import load_config
+    from nanobot.rag import DocumentStore, SentenceTransformerEmbeddingProvider, SearchResultWithContext
+
+    config = load_config()
+    workspace = config.workspace_path
+    rag_config = config.tools.rag
+
+    console.print(f"{__logo__} Searching...\n")
+
+    if not rag_config.enabled:
+        console.print("[yellow]RAG is disabled in config[/yellow]")
+        raise typer.Exit(1)
+
+    db_path = workspace / "rag" / "docs.db"
+
+    if not db_path.exists():
+        console.print("[red]No index found. Run 'nanobot rag refresh' first.[/red]")
+        raise typer.Exit(1)
+
+    try:
+        embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
+        store = DocumentStore(db_path, embedding_provider, rag_config)
+    except ImportError as e:
+        console.print(f"[red]RAG dependencies not installed: {e}[/red]")
+        console.print("Install with: pip install 'nanobot-ai[rag]'")
+        raise typer.Exit(1)
+
+    import asyncio
+
+    async def search():
+        return await store.search_advanced(query)
+
+    with console.status("Searching...", spinner="dots"):
+        results = asyncio.run(search())
+
+    if not results:
+        console.print(f"[yellow]No results found for: {query}[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(f"[bold]Results for:[/bold] {query}\n")
+
+    for i, result in enumerate(results, 1):
+        content = result.combined_content
+        if len(content) > 400:
+            content = content[:397] + "..."
+        doc_title = result.document.title or result.document.filename
+        console.print(f"[{i}] {doc_title} (score: {result.final_score:.2f})")
+        if result.chunk.section_title:
+            console.print(f"    Section: {result.chunk.section_title}")
+        console.print(f"    {content}\n")
+
+    store.close()
 
 
 # ============================================================================

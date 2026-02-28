@@ -299,6 +299,34 @@ class RAGConfig(Base):
     """RAG (Retrieval-Augmented Generation) configuration."""
 
     enabled: bool = True
+
+    # Chunking strategy (Phase 2b)
+    chunk_strategy: str = "phase2b"  # "fixed" | "paragraph" | "phase2b"
+    min_chunk_size: int = 500
+    max_chunk_size: int = 800
+    chunk_overlap_ratio: float = 0.12  # 12% overlap between chunks
+
+    # Context expansion
+    enable_context_expansion: bool = True
+    context_prev_chunks: int = 1
+    context_next_chunks: int = 1
+
+    # Document-level search
+    enable_document_level: bool = True
+    top_documents: int = 3
+
+    # Thresholds (BM25 scores are negative, normalized to 0-1, use lower values)
+    bm25_threshold: float = 0.05
+    vector_threshold: float = 0.3
+    rerank_threshold: float = 0.5
+    dedup_threshold: float = 0.7
+
+    # Reranker (MacBook Pro M4 24GB optimized)
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    enable_rerank: bool = True
+    rerank_top_k: int = 20  # Only rerank top-20 for performance
+
+    # Legacy / fallback
     chunk_size: int = 1000
     chunk_overlap: int = 200
     top_k: int = 5

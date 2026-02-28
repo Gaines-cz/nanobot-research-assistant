@@ -132,6 +132,7 @@ class AgentLoop:
                     chunk_size=self.rag_config.chunk_size,
                     chunk_overlap=self.rag_config.chunk_overlap,
                     embedding_model=self.rag_config.embedding_model,
+                    rag_config=self.rag_config,
                 )
                 self.tools.register(retrieve_tool)
                 self._retrieve_tool = retrieve_tool
@@ -361,6 +362,13 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+        # Close RAG tool if it exists
+        if hasattr(self, '_retrieve_tool') and self._retrieve_tool is not None:
+            try:
+                self._retrieve_tool.close()
+                logger.debug("RAG tool closed")
+            except Exception as e:
+                logger.warning("Error closing RAG tool: {}", e)
 
     def _get_consolidation_lock(self, session_key: str) -> asyncio.Lock:
         lock = self._consolidation_locks.get(session_key)
