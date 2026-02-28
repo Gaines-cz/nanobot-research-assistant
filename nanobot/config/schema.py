@@ -322,15 +322,21 @@ class RAGConfig(Base):
     dedup_threshold: float = 0.7
 
     # Reranker (MacBook Pro M4 24GB optimized)
-    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"  # Multi-language reranker
     enable_rerank: bool = True
     rerank_top_k: int = 20  # Only rerank top-20 for performance
+
+    # Query expansion
+    enable_query_expand: bool = True
+
+    # PDF parser
+    pdf_parser: str = "pymupdf"  # "pypdf" | "pymupdf"
 
     # Legacy / fallback
     chunk_size: int = 1000
     chunk_overlap: int = 200
     top_k: int = 5
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model: str = "BAAI/bge-m3"  # Multi-language, good for scientific text
     auto_scan_on_startup: bool = True  # Auto-scan docs on startup
 
 

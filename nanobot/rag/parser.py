@@ -89,12 +89,33 @@ class DocumentParser:
 
     @staticmethod
     def parse_pdf(path: Path) -> str:
-        """Parse a PDF file using pypdf."""
+        """Parse a PDF file using PyMuPDF with pypdf fallback."""
+        # Try PyMuPDF first (better quality)
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(path)
+            parts: list[str] = []
+
+            for page in doc:
+                # Use blocks to maintain reading order
+                blocks = page.get_text("blocks", sort=True)
+                for block in blocks:
+                    text = block[4].strip()
+                    if text:
+                        parts.append(text)
+
+            doc.close()
+            if parts:
+                return "\n\n".join(parts)
+        except ImportError:
+            pass
+
+        # Fallback to pypdf
         try:
             from pypdf import PdfReader
         except ImportError:
             raise ImportError(
-                "pypdf is required for PDF parsing. "
+                "PyMuPDF or pypdf is required for PDF parsing. "
                 "Install with: pip install 'nanobot-ai[rag]'"
             )
 

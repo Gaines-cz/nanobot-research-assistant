@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
+**⚠️ Important: This project is a personal research assistant built on nanobot (the base framework). Development is in progress.**
+
 nanobot is an ultra-lightweight personal AI assistant framework (~4,000 lines of core code) built in Python. It provides a complete agent system with LLM integration, chat channels, tools, memory, and scheduling.
 
 ## Key Architecture

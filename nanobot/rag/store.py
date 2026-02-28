@@ -11,7 +11,8 @@ from loguru import logger
 from nanobot.config.schema import RAGConfig
 from nanobot.rag.embeddings import EmbeddingProvider
 from nanobot.rag.parser import DocumentParser, SemanticChunk
-from nanobot.rag.rerank import RerankService
+from nanobot.rag.query import QueryExpander
+from nanobot.rag.rerank import CrossEncoderReranker, RerankService
 
 
 @dataclass
@@ -89,11 +90,15 @@ class DocumentStore:
         self._rerank_service: Optional[RerankService] = None
         if self.config.enable_rerank and embedding_provider is not None:
             self._rerank_service = RerankService(
+                reranker=CrossEncoderReranker(self.config.rerank_model),
                 rerank_threshold=self.config.rerank_threshold,
                 dedup_threshold=self.config.dedup_threshold,
                 rerank_top_k=self.config.rerank_top_k,
                 enable_rerank=self.config.enable_rerank,
             )
+
+        # Initialize query expander
+        self._query_expander = QueryExpander(enabled=self.config.enable_query_expand)
 
     def _ensure_db_dir(self) -> None:
         """Ensure the database directory exists."""
@@ -965,6 +970,9 @@ class DocumentStore:
         3. Document-level prioritization (Top3 docs)
         4. Cross-Encoder rerank (Top20, M4 optimized) + semantic dedup
         """
+        # Expand query (abbreviations, synonyms)
+        query = self._query_expander.expand(query)
+
         # Step 1-3: Core recall -> Context expansion -> Document-level -> Merge
         core_results = await self._step1_core_chunk_recall(query)
         if not core_results:
@@ -997,6 +1005,8 @@ class DocumentStore:
         Returns:
             List of SearchResult sorted by relevance
         """
+        # Expand query (abbreviations, synonyms)
+        query = self._query_expander.expand(query)
         if self._vector_enabled:
             try:
                 vector_results = await self._vector_search(query, top_k * 2)
