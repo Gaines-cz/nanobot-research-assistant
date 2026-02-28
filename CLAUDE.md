@@ -10,6 +10,16 @@ Since this project is not yet released in production, breaking changes are accep
 
 nanobot is an ultra-lightweight personal AI assistant framework (~4,000 lines of core code) built in Python. It provides a complete agent system with LLM integration, chat channels, tools, memory, and scheduling.
 
+## Documentation Convention
+
+**Documentation language:** Documents created during development (especially in `/docs/` directory) should be written in **Chinese (中文)** unless otherwise specified.
+
+This includes:
+- Implementation plans (实施计划)
+- Design documents (设计文档)
+- Change logs (改动说明)
+- Bug fix records (Bug 修复记录)
+
 ## Key Architecture
 
 ### High-Level Flow

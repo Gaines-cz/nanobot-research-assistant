@@ -99,10 +99,16 @@ class HeartbeatService:
             model=self.model,
         )
 
-        if not response.has_tool_calls:
+        if not response.tool_calls:
+            logger.warning("Heartbeat: no tool calls found")
             return "skip", ""
 
+        # Process the first tool call
         args = response.tool_calls[0].arguments
+
+        if len(response.tool_calls) > 1:
+            logger.warning("Heartbeat: %d tool calls found, processing only the first", len(response.tool_calls))
+
         return args.get("action", "skip"), args.get("tasks", "")
 
     async def start(self) -> None:

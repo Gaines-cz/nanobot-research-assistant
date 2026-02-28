@@ -7,12 +7,12 @@ import json
 import re
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory import MemoryStore, MemoryStoreOptimized
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -50,6 +50,7 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
+        memory_model: str | None = None,  # Optional: separate model for memory consolidation
         max_iterations: int = 40,
         temperature: float = 0.1,
         max_tokens: int = 4096,
@@ -69,6 +70,8 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        # memory_model defaults to model if not specified
+        self.memory_model = memory_model or self.model
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -79,7 +82,18 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self.rag_config = rag_config or RAGConfig()
 
-        self.context = ContextBuilder(workspace)
+        # Create embedding provider for memory dedup (if RAG dependencies available)
+        self._embedding_provider = None
+        if self.rag_config.enabled:
+            try:
+                from nanobot.rag import SentenceTransformerEmbeddingProvider
+                self._embedding_provider = SentenceTransformerEmbeddingProvider(
+                    self.rag_config.embedding_model
+                )
+            except ImportError:
+                logger.debug("RAG dependencies not installed, semantic dedup disabled")
+
+        self.context = ContextBuilder(workspace, self._embedding_provider)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -109,6 +123,7 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
+        self._retrieve_tool = None  # 先初始化为 None
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -363,7 +378,7 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
         # Close RAG tool if it exists
-        if hasattr(self, '_retrieve_tool') and self._retrieve_tool is not None:
+        if self._retrieve_tool is not None:
             try:
                 self._retrieve_tool.close()
                 logger.debug("RAG tool closed")
@@ -536,8 +551,26 @@ class AgentLoop:
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
-            session, self.provider, self.model,
+        # Try to use optimized consolidation with RAG search
+        if self._retrieve_tool is not None:
+            try:
+                # Ensure RAG tool is initialized
+                self._retrieve_tool._ensure_initialized()
+                rag_store = self._retrieve_tool._doc_store
+
+                if rag_store is not None:
+                    memory_store = MemoryStore(self.workspace, self._embedding_provider)
+                    optimized = MemoryStoreOptimized(memory_store, rag_store)
+                    return await optimized.consolidate(
+                        session, self.provider, self.memory_model,
+                        archive_all=archive_all, memory_window=self.memory_window,
+                    )
+            except Exception as e:
+                logger.warning("Optimized consolidation failed, falling back: {}", e)
+
+        # Fallback to original MemoryStore
+        return await MemoryStore(self.workspace, self._embedding_provider).consolidate(
+            session, self.provider, self.memory_model,
             archive_all=archive_all, memory_window=self.memory_window,
         )
 

@@ -86,6 +86,10 @@ class DocumentStore:
         self._vector_enabled: bool = False
         self._ensure_db_dir()
 
+        # Search cache - stores (timestamp, results)
+        self._search_cache: dict[str, tuple[float, list[SearchResultWithContext]]] = {}
+        self._basic_search_cache: dict[str, tuple[float, list[SearchResult]]] = {}
+
         # Initialize rerank service (Phase 4) - only if embedding_provider is available
         self._rerank_service: Optional[RerankService] = None
         if self.config.enable_rerank and embedding_provider is not None:
@@ -311,6 +315,12 @@ class DocumentStore:
                 logger.info("Deleted document: {}", Path(path).name)
 
         db.commit()
+
+        # Clear search cache after index update
+        self._search_cache.clear()
+        self._basic_search_cache.clear()
+        logger.debug("Search cache cleared after index update")
+
         return stats
 
     async def _add_document(
@@ -665,7 +675,7 @@ class DocumentStore:
                 filtered_ft = [r for r in fulltext_results if r.score >= bm25_threshold]
 
                 # RRF fusion
-                k = 60
+                k = self.config.rrf_k
                 rrf_scores: dict[str, float] = {}
                 sources: dict[str, str] = {}
                 result_map: dict[str, SearchResult] = {}
@@ -970,12 +980,24 @@ class DocumentStore:
         3. Document-level prioritization (Top3 docs)
         4. Cross-Encoder rerank (Top20, M4 optimized) + semantic dedup
         """
+        # Check cache first
+        cache_key = f"{hash(query)}"
+        if self.config.enable_search_cache:
+            if cache_key in self._search_cache:
+                ts, cached_results = self._search_cache[cache_key]
+                if time.time() - ts < self.config.cache_ttl_seconds:
+                    logger.debug("Advanced search cache hit for query: {}", query)
+                    return cached_results
+
         # Expand query (abbreviations, synonyms)
-        query = self._query_expander.expand(query)
+        expanded_query = self._query_expander.expand(query)
 
         # Step 1-3: Core recall -> Context expansion -> Document-level -> Merge
-        core_results = await self._step1_core_chunk_recall(query)
+        core_results = await self._step1_core_chunk_recall(expanded_query)
         if not core_results:
+            # Cache empty results too
+            if self.config.enable_search_cache:
+                self._search_cache[cache_key] = (time.time(), [])
             return []
 
         expanded_chunks = self._step2_context_expansion(core_results)
@@ -984,10 +1006,15 @@ class DocumentStore:
 
         # Step 4: Apply rerank and dedup (Phase 4)
         if self.config.enable_rerank and self._rerank_service:
-            final_results = await self._apply_rerank(query, merged_results)
-            return final_results
+            final_results = await self._apply_rerank(expanded_query, merged_results)
+        else:
+            final_results = merged_results
 
-        return merged_results
+        # Store in cache
+        if self.config.enable_search_cache:
+            self._search_cache[cache_key] = (time.time(), final_results)
+
+        return final_results
 
     async def search(
         self,
@@ -1005,58 +1032,76 @@ class DocumentStore:
         Returns:
             List of SearchResult sorted by relevance
         """
+        # Check cache first
+        cache_key = f"{hash(query)}:{top_k}"
+        if self.config.enable_search_cache:
+            if cache_key in self._basic_search_cache:
+                ts, cached_results = self._basic_search_cache[cache_key]
+                if time.time() - ts < self.config.cache_ttl_seconds:
+                    logger.debug("Basic search cache hit for query: {}", query)
+                    return cached_results
+
         # Expand query (abbreviations, synonyms)
-        query = self._query_expander.expand(query)
+        expanded_query = self._query_expander.expand(query)
+        results: list[SearchResult] = []
+
         if self._vector_enabled:
             try:
-                vector_results = await self._vector_search(query, top_k * 2)
-                fulltext_results = self._fulltext_search(query, top_k * 2)
+                vector_results = await self._vector_search(expanded_query, top_k * 2)
+                fulltext_results = self._fulltext_search(expanded_query, top_k * 2)
 
                 if not vector_results:
                     for result in fulltext_results:
                         result.source = "fulltext"
-                    return fulltext_results[:top_k]
+                    results = fulltext_results[:top_k]
+                else:
+                    k = self.config.rrf_k
+                    rrf_scores: dict[str, float] = {}
+                    sources: dict[str, str] = {}
+                    result_map: dict[str, SearchResult] = {}
 
-                k = 60
-                rrf_scores: dict[str, float] = {}
-                sources: dict[str, str] = {}
-                result_map: dict[str, SearchResult] = {}
-
-                for rank, result in enumerate(vector_results, 1):
-                    key = f"{result.path}:{result.chunk_index}"
-                    rrf_scores[key] = 1.0 / (k + rank)
-                    sources[key] = "vector"
-                    result_map[key] = result
-
-                for rank, result in enumerate(fulltext_results, 1):
-                    key = f"{result.path}:{result.chunk_index}"
-                    score = 1.0 / (k + rank)
-                    if key in rrf_scores:
-                        rrf_scores[key] += score
-                        sources[key] = "hybrid"
-                    else:
-                        rrf_scores[key] = score
-                        sources[key] = "fulltext"
+                    for rank, result in enumerate(vector_results, 1):
+                        key = f"{result.path}:{result.chunk_index}"
+                        rrf_scores[key] = 1.0 / (k + rank)
+                        sources[key] = "vector"
                         result_map[key] = result
 
-                results: list[SearchResult] = []
-                for key, rrf_score in sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True):
-                    base_result = result_map[key]
-                    results.append(SearchResult(
-                        path=base_result.path,
-                        filename=base_result.filename,
-                        chunk_index=base_result.chunk_index,
-                        content=base_result.content,
-                        score=rrf_score,
-                        source=sources[key],
-                    ))
+                    for rank, result in enumerate(fulltext_results, 1):
+                        key = f"{result.path}:{result.chunk_index}"
+                        score = 1.0 / (k + rank)
+                        if key in rrf_scores:
+                            rrf_scores[key] += score
+                            sources[key] = "hybrid"
+                        else:
+                            rrf_scores[key] = score
+                            sources[key] = "fulltext"
+                            result_map[key] = result
 
-                return results[:top_k]
+                    for key, rrf_score in sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True):
+                        base_result = result_map[key]
+                        results.append(SearchResult(
+                            path=base_result.path,
+                            filename=base_result.filename,
+                            chunk_index=base_result.chunk_index,
+                            content=base_result.content,
+                            score=rrf_score,
+                            source=sources[key],
+                        ))
+
+                    results = results[:top_k]
             except Exception as e:
                 logger.warning("Hybrid search failed, falling back to full-text search only: {}", e)
                 self._vector_enabled = False
+                # Fall through to full-text only
 
-        fulltext_results = self._fulltext_search(query, top_k)
-        for result in fulltext_results:
-            result.source = "fulltext"
-        return fulltext_results
+        if not results:
+            fulltext_results = self._fulltext_search(expanded_query, top_k)
+            for result in fulltext_results:
+                result.source = "fulltext"
+            results = fulltext_results
+
+        # Store in cache
+        if self.config.enable_search_cache:
+            self._basic_search_cache[cache_key] = (time.time(), results)
+
+        return results

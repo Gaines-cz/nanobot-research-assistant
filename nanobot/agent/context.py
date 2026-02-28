@@ -6,7 +6,7 @@ import platform
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
@@ -14,24 +14,29 @@ from nanobot.agent.skills import SkillsLoader
 
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
-    
+
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    
-    def __init__(self, workspace: Path):
+
+    def __init__(self, workspace: Path, embedding_provider: Optional[Any] = None):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.memory = MemoryStore(workspace, embedding_provider)
         self.skills = SkillsLoader(workspace)
-    
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the system prompt from identity, bootstrap files, memory, and skills."""
+
+    def build_system_prompt(self, skill_names: list[str] | None = None, query: str | None = None) -> str:
+        """Build the system prompt from identity, bootstrap files, memory, and skills.
+
+        Args:
+            skill_names: Optional list of skill names to load.
+            query: Optional query for selective memory loading.
+        """
         parts = [self._get_identity()]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
+        memory = self.memory.get_memory_context(query)
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
@@ -51,13 +56,13 @@ Skills with available="false" need dependencies installed first - you can try in
 {skills_summary}""")
 
         return "\n\n---\n\n".join(parts)
-    
+
     def _get_identity(self) -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
-        
+
         return f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant.
@@ -67,8 +72,13 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
+- Memory files: {workspace_path}/memory/
+  - PROFILE.md: User profile (preferences, research direction)
+  - PROJECTS.md: Project knowledge (tech stack, architecture)
+  - PAPERS.md: Paper notes and research findings
+  - DECISIONS.md: Decision records (why A over B)
+  - TODOS.md: Current tasks and next steps
+  - HISTORY.md: Append-only event log (grep-searchable)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 ## nanobot Guidelines
@@ -89,19 +99,19 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
-    
+
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
         parts = []
-        
+
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
-        
+
         return "\n\n".join(parts) if parts else ""
-    
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -111,9 +121,18 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         channel: str | None = None,
         chat_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Build the complete message list for an LLM call."""
+        """Build the complete message list for an LLM call.
+
+        Args:
+            history: Conversation history.
+            current_message: The current user message.
+            skill_names: Optional list of skill names to load.
+            media: Optional list of media file paths.
+            channel: Optional channel name for runtime context.
+            chat_id: Optional chat ID for runtime context.
+        """
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, query=current_message)},
             *history,
             {"role": "user", "content": self._build_runtime_context(channel, chat_id)},
             {"role": "user", "content": self._build_user_content(current_message, media)},
@@ -123,7 +142,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         """Build user message content with optional base64-encoded images."""
         if not media:
             return text
-        
+
         images = []
         for path in media:
             p = Path(path)
@@ -132,11 +151,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 continue
             b64 = base64.b64encode(p.read_bytes()).decode()
             images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-        
+
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
-    
+
     def add_tool_result(
         self, messages: list[dict[str, Any]],
         tool_call_id: str, tool_name: str, result: str,
@@ -144,7 +163,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         """Add a tool result to the message list."""
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
         return messages
-    
+
     def add_assistant_message(
         self, messages: list[dict[str, Any]],
         content: str | None,

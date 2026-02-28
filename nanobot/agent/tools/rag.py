@@ -58,6 +58,7 @@ class SearchKnowledgeTool(Tool):
 
         self._doc_store: DocumentStore | None = None
         self._docs_dir: Path | None = None
+        self._memory_dir: Path | None = None
         self._rag_dir: Path | None = None
 
     def _ensure_initialized(self) -> None:
@@ -69,6 +70,8 @@ class SearchKnowledgeTool(Tool):
         self._rag_dir.mkdir(parents=True, exist_ok=True)
         self._docs_dir = self.workspace / "docs"
         self._docs_dir.mkdir(parents=True, exist_ok=True)
+        self._memory_dir = self.workspace / "memory"
+        self._memory_dir.mkdir(parents=True, exist_ok=True)
 
         db_path = self._rag_dir / "docs.db"
 
@@ -76,15 +79,57 @@ class SearchKnowledgeTool(Tool):
         embedding_provider = SentenceTransformerEmbeddingProvider(self.embedding_model)
         self._doc_store = DocumentStore(db_path, embedding_provider, self.rag_config)
 
-    async def scan_and_index(self) -> dict[str, int]:
-        """Scan and index documents in the docs directory."""
+    async def scan_and_index(self, include_memory: bool = None) -> dict[str, int]:
+        """
+        Scan and index documents in docs and memory directories.
+
+        Args:
+            include_memory: If None, uses RAGConfig.enable_memory_index setting.
+                           If True/False, overrides the config.
+        """
         self._ensure_initialized()
         assert self._doc_store is not None
         assert self._docs_dir is not None
-        return await self._doc_store.scan_and_index(
+        assert self._memory_dir is not None
+
+        # Determine whether to include memory
+        if include_memory is None:
+            include_memory = self.rag_config.enable_memory_index
+
+        total_stats = {"added": 0, "updated": 0, "deleted": 0}
+
+        # Index docs/
+        docs_stats = await self._doc_store.scan_and_index(
             self._docs_dir,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
+        )
+        for key in total_stats:
+            total_stats[key] += docs_stats.get(key, 0)
+
+        # Index memory/ (with smaller chunks since memory files are typically small)
+        if include_memory:
+            memory_stats = await self._doc_store.scan_and_index(
+                self._memory_dir,
+                chunk_size=self.rag_config.memory_chunk_size,
+                chunk_overlap=self.rag_config.memory_chunk_overlap,
+            )
+            for key in total_stats:
+                total_stats[key] += memory_stats.get(key, 0)
+
+        return total_stats
+
+    async def index_memory_only(self) -> dict[str, int]:
+        """Index only the memory directory (for consolidation updates)."""
+        self._ensure_initialized()
+        assert self._doc_store is not None
+        assert self._memory_dir is not None
+
+        # 使用配置中的参数，而非硬编码
+        return await self._doc_store.scan_and_index(
+            self._memory_dir,
+            chunk_size=self.rag_config.memory_chunk_size,
+            chunk_overlap=self.rag_config.memory_chunk_overlap,
         )
 
     async def execute(self, query: str, top_k: int = 5) -> str:

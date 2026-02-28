@@ -206,6 +206,7 @@ class AgentDefaults(Base):
 
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
+    memory_model: str | None = None  # Optional: separate model for memory consolidation
     provider: str = "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     max_tokens: int = 8192
     temperature: float = 0.1
@@ -332,12 +333,24 @@ class RAGConfig(Base):
     # PDF parser
     pdf_parser: str = "pymupdf"  # "pypdf" | "pymupdf"
 
+    # Memory index (for RAG + Memory integration)
+    enable_memory_index: bool = True  # Include memory/ in RAG index
+    memory_chunk_size: int = 500  # Smaller chunks for memory files
+    memory_chunk_overlap: int = 50
+
     # Legacy / fallback
     chunk_size: int = 1000
     chunk_overlap: int = 200
     top_k: int = 5
     embedding_model: str = "BAAI/bge-m3"  # Multi-language, good for scientific text
     auto_scan_on_startup: bool = True  # Auto-scan docs on startup
+
+    # Hybrid search weights (RRF parameter)
+    rrf_k: int = 60  # RRF parameter k
+
+    # Search cache
+    enable_search_cache: bool = True
+    cache_ttl_seconds: int = 300  # Cache TTL in seconds (5 minutes)
 
 
 class ToolsConfig(Base):
