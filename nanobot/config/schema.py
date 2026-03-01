@@ -207,6 +207,7 @@ class AgentDefaults(Base):
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     memory_model: str | None = None  # Optional: separate model for memory consolidation
+    subagent_model: str | None = None  # Optional: separate model for subagents
     provider: str = "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     max_tokens: int = 8192
     temperature: float = 0.1
@@ -296,6 +297,48 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # Seconds before a tool call is cancelled
 
 
+# RAG default constants (extracted magic numbers for readability)
+class RAGDefaults:
+    """Default values for RAG configuration."""
+    # Chunking
+    MIN_CHUNK_SIZE: int = 500
+    MAX_CHUNK_SIZE: int = 800
+    CHUNK_OVERLAP_RATIO: float = 0.12  # 12% overlap
+
+    # Context expansion
+    CONTEXT_PREV_CHUNKS: int = 1
+    CONTEXT_NEXT_CHUNKS: int = 1
+
+    # Document-level search
+    TOP_DOCUMENTS: int = 3
+
+    # Thresholds
+    BM25_THRESHOLD: float = 0.05
+    VECTOR_THRESHOLD: float = 0.3
+    RERANK_THRESHOLD: float = 0.5
+    DEDUP_THRESHOLD: float = 0.7
+
+    # Reranker
+    RERANK_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    RERANK_TOP_K: int = 20
+
+    # Memory index
+    MEMORY_CHUNK_SIZE: int = 500
+    MEMORY_CHUNK_OVERLAP: int = 50
+
+    # Legacy/fallback
+    CHUNK_SIZE: int = 1000
+    CHUNK_OVERLAP: int = 200
+    TOP_K: int = 5
+    EMBEDDING_MODEL: str = "BAAI/bge-m3"
+
+    # Hybrid search
+    RRF_K: int = 60
+
+    # Cache
+    CACHE_TTL_SECONDS: int = 300  # 5 minutes
+
+
 class RAGConfig(Base):
     """RAG (Retrieval-Augmented Generation) configuration."""
 
@@ -303,29 +346,29 @@ class RAGConfig(Base):
 
     # Chunking strategy (Phase 2b)
     chunk_strategy: str = "phase2b"  # "fixed" | "paragraph" | "phase2b"
-    min_chunk_size: int = 500
-    max_chunk_size: int = 800
-    chunk_overlap_ratio: float = 0.12  # 12% overlap between chunks
+    min_chunk_size: int = RAGDefaults.MIN_CHUNK_SIZE
+    max_chunk_size: int = RAGDefaults.MAX_CHUNK_SIZE
+    chunk_overlap_ratio: float = RAGDefaults.CHUNK_OVERLAP_RATIO  # 12% overlap between chunks
 
     # Context expansion
     enable_context_expansion: bool = True
-    context_prev_chunks: int = 1
-    context_next_chunks: int = 1
+    context_prev_chunks: int = RAGDefaults.CONTEXT_PREV_CHUNKS
+    context_next_chunks: int = RAGDefaults.CONTEXT_NEXT_CHUNKS
 
     # Document-level search
     enable_document_level: bool = True
-    top_documents: int = 3
+    top_documents: int = RAGDefaults.TOP_DOCUMENTS
 
     # Thresholds (BM25 scores are negative, normalized to 0-1, use lower values)
-    bm25_threshold: float = 0.05
-    vector_threshold: float = 0.3
-    rerank_threshold: float = 0.5
-    dedup_threshold: float = 0.7
+    bm25_threshold: float = RAGDefaults.BM25_THRESHOLD
+    vector_threshold: float = RAGDefaults.VECTOR_THRESHOLD
+    rerank_threshold: float = RAGDefaults.RERANK_THRESHOLD
+    dedup_threshold: float = RAGDefaults.DEDUP_THRESHOLD
 
     # Reranker (MacBook Pro M4 24GB optimized)
-    rerank_model: str = "BAAI/bge-reranker-v2-m3"  # Multi-language reranker
+    rerank_model: str = RAGDefaults.RERANK_MODEL  # Multi-language reranker
     enable_rerank: bool = True
-    rerank_top_k: int = 20  # Only rerank top-20 for performance
+    rerank_top_k: int = RAGDefaults.RERANK_TOP_K  # Only rerank top-20 for performance
 
     # Query expansion
     enable_query_expand: bool = True
@@ -335,22 +378,22 @@ class RAGConfig(Base):
 
     # Memory index (for RAG + Memory integration)
     enable_memory_index: bool = True  # Include memory/ in RAG index
-    memory_chunk_size: int = 500  # Smaller chunks for memory files
-    memory_chunk_overlap: int = 50
+    memory_chunk_size: int = RAGDefaults.MEMORY_CHUNK_SIZE  # Smaller chunks for memory files
+    memory_chunk_overlap: int = RAGDefaults.MEMORY_CHUNK_OVERLAP
 
     # Legacy / fallback
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
-    top_k: int = 5
-    embedding_model: str = "BAAI/bge-m3"  # Multi-language, good for scientific text
+    chunk_size: int = RAGDefaults.CHUNK_SIZE
+    chunk_overlap: int = RAGDefaults.CHUNK_OVERLAP
+    top_k: int = RAGDefaults.TOP_K
+    embedding_model: str = RAGDefaults.EMBEDDING_MODEL  # Multi-language, good for scientific text
     auto_scan_on_startup: bool = True  # Auto-scan docs on startup
 
     # Hybrid search weights (RRF parameter)
-    rrf_k: int = 60  # RRF parameter k
+    rrf_k: int = RAGDefaults.RRF_K  # RRF parameter k
 
     # Search cache
     enable_search_cache: bool = True
-    cache_ttl_seconds: int = 300  # Cache TTL in seconds (5 minutes)
+    cache_ttl_seconds: int = RAGDefaults.CACHE_TTL_SECONDS  # Cache TTL in seconds (5 minutes)
 
 
 class ToolsConfig(Base):

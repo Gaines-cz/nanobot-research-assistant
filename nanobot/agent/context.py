@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from loguru import logger
+
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 
@@ -17,6 +19,7 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
+    MAX_SYSTEM_PROMPT_LENGTH = 8000  # 为 model 留出空间
 
     def __init__(self, workspace: Path, embedding_provider: Optional[Any] = None):
         self.workspace = workspace
@@ -55,7 +58,18 @@ Skills with available="false" need dependencies installed first - you can try in
 
 {skills_summary}""")
 
-        return "\n\n---\n\n".join(parts)
+        result = "\n\n---\n\n".join(parts)
+
+        # Length check and truncation
+        if len(result) > self.MAX_SYSTEM_PROMPT_LENGTH:
+            logger.warning(
+                "System prompt too long ({} chars > {} limit), truncating",
+                len(result),
+                self.MAX_SYSTEM_PROMPT_LENGTH
+            )
+            result = self._truncate_system_prompt(parts, self.MAX_SYSTEM_PROMPT_LENGTH)
+
+        return result
 
     def _get_identity(self) -> str:
         """Get the core identity section."""
@@ -111,6 +125,26 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def _truncate_system_prompt(self, parts: list[str], max_length: int) -> str:
+        """Truncate system prompt while preserving priority parts.
+
+        Priority: identity > bootstrap > skills > memory
+        """
+        result = parts[0]  # Always keep identity
+
+        for part in parts[1:]:
+            separator = "\n\n---\n\n"
+            if len(result) + len(part) + len(separator) < max_length:
+                result += separator + part
+            else:
+                # Partial add with truncation notice
+                remaining = max_length - len(result) - 50
+                if remaining > 100:
+                    result += separator + part[:remaining] + "\n\n...[truncated]"
+                break
+
+        return result
 
     def build_messages(
         self,

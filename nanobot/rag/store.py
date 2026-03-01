@@ -1,7 +1,9 @@
 """Document store with vector search and full-text search."""
 
+import asyncio
 import sqlite3
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -78,17 +80,28 @@ class DocumentStore:
     - SQLite FTS5 for full-text search
     """
 
+    # Cache configuration
+    MAX_CACHE_SIZE = 1000  # Maximum number of entries per cache
+    CACHE_TTL = 300  # Cache time-to-live in seconds (5 minutes)
+
     def __init__(self, db_path: Path, embedding_provider: Optional[EmbeddingProvider] = None, config: Optional[RAGConfig] = None):
         self.db_path = db_path
         self.embedding_provider = embedding_provider
         self.config = config or RAGConfig()
         self._db: sqlite3.Connection | None = None
         self._vector_enabled: bool = False
+        self._vector_disabled_at: float | None = None  # Record when vector search was disabled
+        self._vector_cooldown_seconds: int = 300  # 5 minutes cooldown before retry
         self._ensure_db_dir()
 
-        # Search cache - stores (timestamp, results)
-        self._search_cache: dict[str, tuple[float, list[SearchResultWithContext]]] = {}
-        self._basic_search_cache: dict[str, tuple[float, list[SearchResult]]] = {}
+        # Batch index update (P2-4)
+        self._index_pending: bool = False
+        self._index_lock = asyncio.Lock()
+        self._index_delay_seconds: float = 30.0  # 30 seconds delay for batching
+
+        # Search cache with LRU + TTL (using OrderedDict for LRU ordering)
+        self._search_cache: OrderedDict[str, tuple[float, list[SearchResultWithContext]]] = OrderedDict()
+        self._basic_search_cache: OrderedDict[str, tuple[float, list[SearchResult]]] = OrderedDict()
 
         # Initialize rerank service (Phase 4) - only if embedding_provider is available
         self._rerank_service: Optional[RerankService] = None
@@ -108,6 +121,38 @@ class DocumentStore:
         """Ensure the database directory exists."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _cleanup_cache(self, cache: OrderedDict) -> None:
+        """Remove expired and excess entries from cache."""
+        now = time.time()
+        # Remove expired entries
+        expired_keys = [k for k, (ts, _) in cache.items() if now - ts > self.CACHE_TTL]
+        for k in expired_keys:
+            del cache[k]
+
+        # Remove excess entries (LRU - oldest first)
+        while len(cache) > self.MAX_CACHE_SIZE:
+            cache.popitem(last=False)
+
+    def _get_from_cache(self, cache: OrderedDict, key: str) -> list | None:
+        """Get from cache with TTL check and LRU touch."""
+        if key in cache:
+            ts, results = cache[key]
+            if time.time() - ts > self.CACHE_TTL:
+                del cache[key]
+                return None
+            # Move to end (LRU - most recently used)
+            cache.move_to_end(key)
+            return results
+        return None
+
+    def _set_in_cache(self, cache: OrderedDict, key: str, results: list) -> None:
+        """Set in cache with current timestamp and LRU eviction."""
+        # Cleanup before adding (evict if necessary)
+        self._cleanup_cache(cache)
+        cache[key] = (time.time(), results)
+        # Move to end (most recently used)
+        cache.move_to_end(key)
+
     def _get_db(self) -> sqlite3.Connection:
         """Get or create the database connection."""
         if self._db is not None:
@@ -116,6 +161,12 @@ class DocumentStore:
         self._db = sqlite3.connect(self.db_path)
         self._db.execute("PRAGMA foreign_keys = ON")
         self._db.execute("PRAGMA journal_mode = WAL")
+
+        # Check if we should attempt to re-enable vector search after cooldown
+        if not self._vector_enabled and self._vector_disabled_at is not None:
+            if time.time() - self._vector_disabled_at >= self._vector_cooldown_seconds:
+                logger.info("Attempting to re-enable vector search after cooldown")
+                self._vector_disabled_at = None  # Clear cooldown state to allow retry
 
         # Try to load sqlite-vec extension with graceful fallback (only if embedding_provider is available)
         self._vector_enabled = False
@@ -144,6 +195,7 @@ class DocumentStore:
                     logger.warning("sqlite3 does not support enable_load_extension, vector search disabled")
             except Exception as e:
                 logger.warning("Could not load sqlite-vec extension, vector search disabled: {}", e)
+                self._vector_disabled_at = time.time()  # Record when disabled
 
         self._init_schema()
         return self._db
@@ -224,6 +276,7 @@ class DocumentStore:
             except Exception as e:
                 logger.warning("Could not create vector table, vector search disabled: {}", e)
                 self._vector_enabled = False
+                self._vector_disabled_at = time.time()
 
         # FTS5 virtual table for full-text search
         db.execute("""
@@ -264,9 +317,15 @@ class DocumentStore:
         """
         Scan docs_dir and index documents.
 
+        If called while _index_pending, skip immediately (already scheduled).
+
         Returns:
             Dict with counts: {"added": n, "updated": n, "deleted": n}
         """
+        if self._index_pending:
+            logger.debug("Index update already scheduled, skipping immediate update")
+            return {"added": 0, "updated": 0, "deleted": 0}
+
         if not docs_dir.exists():
             docs_dir.mkdir(parents=True, exist_ok=True)
             logger.info("Created docs directory: {}", docs_dir)
@@ -322,6 +381,30 @@ class DocumentStore:
         logger.debug("Search cache cleared after index update")
 
         return stats
+
+    async def schedule_index_update(self, docs_dir: Path, chunk_size: int = 1000, chunk_overlap: int = 200) -> None:
+        """Schedule an index update after a delay to batch multiple changes."""
+        async with self._index_lock:
+            if self._index_pending:
+                logger.debug("Index update already scheduled")
+                return
+            self._index_pending = True
+
+        # Schedule the delayed index update
+        await asyncio.sleep(self._index_delay_seconds)
+
+        async with self._index_lock:
+            if not self._index_pending:
+                return
+            self._index_pending = False
+
+        try:
+            await self.scan_and_index(docs_dir, chunk_size, chunk_overlap)
+            logger.info("Scheduled index update completed")
+        except Exception as e:
+            logger.error("Scheduled index update failed: {}", e)
+            async with self._index_lock:
+                self._index_pending = False
 
     async def _add_document(
         self,
@@ -381,6 +464,7 @@ class DocumentStore:
             except Exception as e:
                 logger.warning("Could not generate embeddings, vector search disabled: {}", e)
                 self._vector_enabled = False
+                self._vector_disabled_at = time.time()
                 embeddings = None
 
         for idx, chunk in enumerate(semantic_chunks):
@@ -403,6 +487,7 @@ class DocumentStore:
                 except Exception as e:
                     logger.warning("Could not insert embedding, vector search disabled: {}", e)
                     self._vector_enabled = False
+                    self._vector_disabled_at = time.time()
 
     async def _update_document(
         self,
@@ -477,6 +562,7 @@ class DocumentStore:
         except Exception as e:
             logger.warning("Vector search failed: {}", e)
             self._vector_enabled = False
+            self._vector_disabled_at = time.time()
             return []
 
         return results
@@ -710,8 +796,12 @@ class DocumentStore:
                     ))
 
                 return results[:top_k]
+            except sqlite3.DatabaseError as e:
+                logger.error("Database error during hybrid search, check integrity: {}", e)
+                raise  # 数据库错误不应该 fallback
             except Exception as e:
-                logger.warning("Hybrid search failed, falling back: {}", e)
+                logger.warning("Hybrid search failed, falling back: {}", e, exc_info=True)
+                # Fallback to full-text only
 
         # Fallback: full-text only
         fulltext_results = self._fulltext_search(query, top_k)
@@ -983,11 +1073,10 @@ class DocumentStore:
         # Check cache first
         cache_key = f"{hash(query)}"
         if self.config.enable_search_cache:
-            if cache_key in self._search_cache:
-                ts, cached_results = self._search_cache[cache_key]
-                if time.time() - ts < self.config.cache_ttl_seconds:
-                    logger.debug("Advanced search cache hit for query: {}", query)
-                    return cached_results
+            cached_results = self._get_from_cache(self._search_cache, cache_key)
+            if cached_results is not None:
+                logger.debug("Advanced search cache hit for query: {}", query)
+                return cached_results
 
         # Expand query (abbreviations, synonyms)
         expanded_query = self._query_expander.expand(query)
@@ -997,7 +1086,7 @@ class DocumentStore:
         if not core_results:
             # Cache empty results too
             if self.config.enable_search_cache:
-                self._search_cache[cache_key] = (time.time(), [])
+                self._set_in_cache(self._search_cache, cache_key, [])
             return []
 
         expanded_chunks = self._step2_context_expansion(core_results)
@@ -1012,7 +1101,7 @@ class DocumentStore:
 
         # Store in cache
         if self.config.enable_search_cache:
-            self._search_cache[cache_key] = (time.time(), final_results)
+            self._set_in_cache(self._search_cache, cache_key, final_results)
 
         return final_results
 
@@ -1035,11 +1124,10 @@ class DocumentStore:
         # Check cache first
         cache_key = f"{hash(query)}:{top_k}"
         if self.config.enable_search_cache:
-            if cache_key in self._basic_search_cache:
-                ts, cached_results = self._basic_search_cache[cache_key]
-                if time.time() - ts < self.config.cache_ttl_seconds:
-                    logger.debug("Basic search cache hit for query: {}", query)
-                    return cached_results
+            cached_results = self._get_from_cache(self._basic_search_cache, cache_key)
+            if cached_results is not None:
+                logger.debug("Basic search cache hit for query: {}", query)
+                return cached_results
 
         # Expand query (abbreviations, synonyms)
         expanded_query = self._query_expander.expand(query)
@@ -1102,6 +1190,6 @@ class DocumentStore:
 
         # Store in cache
         if self.config.enable_search_cache:
-            self._basic_search_cache[cache_key] = (time.time(), results)
+            self._set_in_cache(self._basic_search_cache, cache_key, results)
 
         return results

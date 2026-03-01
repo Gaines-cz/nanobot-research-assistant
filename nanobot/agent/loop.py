@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
@@ -51,6 +52,7 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         memory_model: str | None = None,  # Optional: separate model for memory consolidation
+        subagent_model: str | None = None,  # Optional: separate model for subagents
         max_iterations: int = 40,
         temperature: float = 0.1,
         max_tokens: int = 4096,
@@ -72,6 +74,8 @@ class AgentLoop:
         self.model = model or provider.get_default_model()
         # memory_model defaults to model if not specified
         self.memory_model = memory_model or self.model
+        # subagent_model defaults to model if not specified
+        self.subagent_model = subagent_model or self.model
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -100,7 +104,7 @@ class AgentLoop:
             provider=provider,
             workspace=workspace,
             bus=bus,
-            model=self.model,
+            model=self.subagent_model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             serper_api_key=serper_api_key,
@@ -113,11 +117,16 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._mcp_retry_count = 0
+        self._mcp_retry_delay = 1.0  # Initial delay
+        self._mcp_max_retry_delay = 300.0  # Max 5 minutes
+        self._mcp_last_failure_time: float = 0
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}  # Per-session locks for message processing
+        self._session_locks_lock = asyncio.Lock()  # Protects _session_locks dict
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
-        self._processing_lock = asyncio.Lock()
         self._rag_initialized = False
         self._register_default_tools()
 
@@ -158,9 +167,18 @@ class AgentLoop:
             self._retrieve_tool = None
 
     async def _connect_mcp(self) -> None:
-        """Connect to configured MCP servers (one-time, lazy)."""
+        """Connect to configured MCP servers with exponential backoff."""
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
+
+        # Check if we should wait before retrying
+        if self._mcp_last_failure_time > 0:
+            elapsed = time.time() - self._mcp_last_failure_time
+            if elapsed < self._mcp_retry_delay:
+                logger.debug("MCP connection retry cooldown: {:.1f}s remaining",
+                            self._mcp_retry_delay - elapsed)
+                return
+
         self._mcp_connecting = True
         from nanobot.agent.tools.mcp import connect_mcp_servers
         try:
@@ -168,8 +186,20 @@ class AgentLoop:
             await self._mcp_stack.__aenter__()
             await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
             self._mcp_connected = True
+            self._mcp_retry_count = 0  # Reset on success
+            logger.info("MCP servers connected successfully")
         except Exception as e:
-            logger.error("Failed to connect MCP servers (will retry next message): {}", e)
+            self._mcp_retry_count += 1
+            self._mcp_last_failure_time = time.time()
+            # Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 300s...
+            self._mcp_retry_delay = min(
+                self._mcp_max_retry_delay,
+                self._mcp_retry_delay * 2
+            )
+            logger.error(
+                "MCP connection failed (retry {} in {:.1f}s): {}",
+                self._mcp_retry_count, self._mcp_retry_delay, e
+            )
             if self._mcp_stack:
                 try:
                     await self._mcp_stack.aclose()
@@ -324,7 +354,7 @@ class AgentLoop:
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                task.add_done_callback(self._make_task_cleanup(msg.session_key))
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -343,8 +373,9 @@ class AgentLoop:
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        async with self._processing_lock:
+        """Process a message under the per-session lock."""
+        lock = await self._get_session_lock(msg.session_key)
+        async with lock:
             try:
                 response = await self._process_message(msg)
                 if response is not None:
@@ -365,13 +396,16 @@ class AgentLoop:
                 ))
 
     async def close_mcp(self) -> None:
-        """Close MCP connections."""
+        """Close MCP connections and cleanup session locks."""
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
             self._mcp_stack = None
+
+        # Cleanup session locks
+        self._session_locks.clear()
 
     def stop(self) -> None:
         """Stop the agent loop."""
@@ -392,10 +426,29 @@ class AgentLoop:
             self._consolidation_locks[session_key] = lock
         return lock
 
+    async def _get_session_lock(self, session_key: str) -> asyncio.Lock:
+        """Get or create a lock for the given session."""
+        async with self._session_locks_lock:
+            if session_key not in self._session_locks:
+                self._session_locks[session_key] = asyncio.Lock()
+            return self._session_locks[session_key]
+
     def _prune_consolidation_lock(self, session_key: str, lock: asyncio.Lock) -> None:
         """Drop lock entry if no longer in use."""
         if not lock.locked():
             self._consolidation_locks.pop(session_key, None)
+
+    def _make_task_cleanup(self, session_key: str) -> Callable[[asyncio.Task], None]:
+        """Create a cleanup callback for task completion."""
+        def _cleanup(task: asyncio.Task) -> None:
+            """Remove task from active tasks list."""
+            tasks = self._active_tasks.get(session_key, [])
+            if task in tasks:
+                tasks.remove(task)
+                if not tasks:
+                    # Clean up empty list
+                    self._active_tasks.pop(session_key, None)
+        return _cleanup
 
     async def _process_message(
         self,
@@ -471,8 +524,11 @@ class AgentLoop:
 
             async def _consolidate_and_unlock():
                 try:
-                    async with lock:
-                        await self._consolidate_memory(session)
+                    async with asyncio.timeout(60):  # 60s 超时
+                        async with lock:
+                            await self._consolidate_memory(session)
+                except asyncio.TimeoutError:
+                    logger.error("Memory consolidation timed out after 60s for session {}", session.key)
                 finally:
                     self._consolidating.discard(session.key)
                     self._prune_consolidation_lock(session.key, lock)

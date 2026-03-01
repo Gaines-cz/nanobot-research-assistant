@@ -2,6 +2,8 @@
 
 import asyncio
 
+from loguru import logger
+
 from nanobot.bus.events import InboundMessage, OutboundMessage
 
 
@@ -13,13 +15,21 @@ class MessageBus:
     them and pushes responses to the outbound queue.
     """
 
-    def __init__(self):
-        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
-        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+    def __init__(self, maxsize: int = 1000):
+        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=maxsize)
+        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue(maxsize=maxsize)
+        self._maxsize = maxsize
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
-        await self.inbound.put(msg)
+        try:
+            await asyncio.wait_for(self.inbound.put(msg), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Inbound queue full ({} items), message dropped: {}",
+                self.inbound.qsize(),
+                msg.sender_id
+            )
 
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""
@@ -27,7 +37,14 @@ class MessageBus:
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
-        await self.outbound.put(msg)
+        try:
+            await asyncio.wait_for(self.outbound.put(msg), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Outbound queue full ({} items), message dropped: {}",
+                self.outbound.qsize(),
+                msg.chat_id
+            )
 
     async def consume_outbound(self) -> OutboundMessage:
         """Consume the next outbound message (blocks until available)."""

@@ -41,12 +41,30 @@ class ToolRegistry:
 
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
+            # More helpful error with available tools count
+            available = self.tool_names
+            return (
+                f"Error: Tool '{name}' not found.\n"
+                f"Available tools ({len(available)}): {', '.join(available[:10])}"
+                + (f" and {len(available)-10} more..." if len(available) > 10 else "")
+            )
 
         try:
             errors = tool.validate_params(params)
             if errors:
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
+                # Add parameter hints based on error type
+                hints = []
+                for err in errors:
+                    if "required" in err:
+                        hints.append("Missing required parameter. Check tool schema.")
+                    elif "type" in err:
+                        hints.append("Parameter type mismatch. Expected format may differ.")
+                return (
+                    f"Error: Invalid parameters for tool '{name}': "
+                    + "; ".join(errors)
+                    + (f"\nHints: {'; '.join(hints)}" if hints else "")
+                    + _HINT
+                )
             result = await tool.execute(**params)
             if isinstance(result, str) and result.startswith("Error"):
                 return result + _HINT

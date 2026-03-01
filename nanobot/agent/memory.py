@@ -226,6 +226,11 @@ class MemoryStore:
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
         """计算余弦相似度。"""
         import math
+
+        if len(a) != len(b):
+            logger.warning("Embedding length mismatch: {} vs {}", len(a), len(b))
+            return 0.0
+
         dot_product = sum(x * y for x, y in zip(a, b))
         norm_a = math.sqrt(sum(x * x for x in a))
         norm_b = math.sqrt(sum(x * x for x in b))
@@ -364,10 +369,22 @@ class MemoryStore:
             return True
 
         except Exception as e:
-            logger.warning("Atomic operation failed, rolling back: {}", e)
-            # 回滚：恢复已修改的文件
+            logger.error("Atomic operation failed, rolling back: {}", e)
+            rollback_failed = []
+
             for file, old_content in reversed(applied):
-                self.replace(file, old_content)
+                try:
+                    self.replace(file, old_content)
+                    logger.debug("Rollback succeeded for {}", file.value)
+                except Exception as rollback_e:
+                    logger.error("Rollback failed for {}: {}", file.value, rollback_e)
+                    rollback_failed.append(file)
+
+            if rollback_failed:
+                logger.critical(
+                    "Rollback incomplete - manual intervention may be needed: {}",
+                    [f.value for f in rollback_failed]
+                )
             return False
 
     def append_history(self, entry: str) -> None:
@@ -460,19 +477,21 @@ class MemoryStore:
         if archive_all:
             old_messages = session.messages
             keep_count = 0
-            logger.info("Memory consolidation (archive_all): {} messages", len(session.messages))
+            logger.info("Memory consolidation started (archive_all): total_messages={}", len(session.messages))
         else:
             keep_count = memory_window // 2
             if len(session.messages) <= keep_count:
+                logger.debug("Memory consolidation skipped: {} messages <= keep_count {}", len(session.messages), keep_count)
                 return True
             if len(session.messages) - session.last_consolidated <= 0:
+                logger.debug("Memory consolidation skipped: no unconsolidated messages")
                 return True
             old_messages = session.messages[session.last_consolidated : -keep_count]
             if not old_messages:
+                logger.debug("Memory consolidation skipped: empty old_messages slice")
                 return True
-            logger.info(
-                "Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count
-            )
+            logger.info("Memory consolidation started: total_messages={}, old_messages={}, keep_count={}",
+                        len(session.messages), len(old_messages), keep_count)
 
         lines = []
         for m in old_messages:
@@ -494,6 +513,7 @@ class MemoryStore:
 {chr(10).join(lines)}"""
 
         try:
+            logger.debug("Calling LLM for memory consolidation with {} messages", len(old_messages))
             response = await provider.chat(
                 messages=[
                     {
@@ -505,6 +525,8 @@ class MemoryStore:
                 tools=_SAVE_MEMORY_TOOL,
                 model=model,
             )
+
+            logger.debug("LLM response tool_calls: {}", len(response.tool_calls))
 
             if not response.has_tool_calls:
                 logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
@@ -541,22 +563,32 @@ class MemoryStore:
                 if not isinstance(entry, str):
                     entry = json.dumps(entry, ensure_ascii=False)
                 self.append_history(entry)
+                logger.debug("History entry appended: {}", entry[:100])
 
             # 2. Apply incremental operations atomically
             operations = args.get("operations", [])
+            logger.debug("Applying {} memory operations", len(operations))
+
+            for i, op in enumerate(operations):
+                op_file = op.get("file", "unknown")
+                op_action = op.get("action", "unknown")
+                op_content = op.get("content", "")
+                content_preview = (op_content or "")[:50] if op_content else ""
+                logger.debug("Operation {}/{}: file={}, action={}, content_preview={}",
+                            i + 1, len(operations), op_file, op_action, content_preview)
+
             if not self.apply_operations_atomic(operations):
                 logger.warning("Memory consolidation: operations failed")
                 return False
 
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
             logger.info(
-                "Memory consolidation done: {} messages, last_consolidated={}",
-                len(session.messages),
-                session.last_consolidated,
+                "Memory consolidation completed: history_entries={}, operations_applied={}, last_consolidated={}",
+                len(session.messages), len(operations), session.last_consolidated,
             )
             return True
         except Exception:
-            logger.exception("Memory consolidation failed")
+            logger.exception("Memory consolidation failed with exception")
             return False
 
 
@@ -768,29 +800,37 @@ class MemoryStoreOptimized:
         if archive_all:
             old_messages = session.messages
             keep_count = 0
-            logger.info("Memory consolidation (archive_all): {} messages", len(session.messages))
+            logger.info("Memory consolidation started (optimized, archive_all): total_messages={}", len(session.messages))
         else:
             keep_count = memory_window // 2
             if len(session.messages) <= keep_count:
+                logger.debug("Memory consolidation skipped (optimized): {} messages <= keep_count {}", len(session.messages), keep_count)
                 return True
             if len(session.messages) - session.last_consolidated <= 0:
+                logger.debug("Memory consolidation skipped (optimized): no unconsolidated messages")
                 return True
             old_messages = session.messages[session.last_consolidated:-keep_count]
             if not old_messages:
+                logger.debug("Memory consolidation skipped (optimized): empty old_messages slice")
                 return True
-            logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
+            logger.info("Memory consolidation started (optimized): total_messages={}, old_messages={}, keep_count={}",
+                        len(session.messages), len(old_messages), keep_count)
 
         try:
             # Step 2: LLM compress
+            logger.debug("Step 2: Compressing {} messages into summary", len(old_messages))
             summary = await self._compress_messages(old_messages, provider, model)
             logger.debug("Compressed summary: {}", summary[:200])
 
             # Step 3: RAG search related memory
+            logger.debug("Step 3: Searching for related memories")
             related_memory = await self._search_related_memory(summary, top_k=3)
             logger.debug("Found {} related memories", len(related_memory))
 
             # Step 4: LLM decide (always call LLM, even without related memory)
+            logger.debug("Step 4: Deciding memory action with context")
             decision = await self._decide_with_context(summary, related_memory, provider, model)
+            logger.debug("LLM decision: action={}, target_file={}", decision.get("action"), decision.get("target_file"))
 
             # Fallback: if LLM doesn't return target_file, infer it from summary
             if "target_file" not in decision:
@@ -799,6 +839,7 @@ class MemoryStoreOptimized:
             # Step 5: Write to memory
             if decision.get("history_entry"):
                 self._memory.append_history(decision["history_entry"])
+                logger.debug("History entry appended: {}", decision["history_entry"][:100])
 
             action = decision.get("action", "skip")
             target_file = decision.get("target_file", "profile")
@@ -817,12 +858,15 @@ class MemoryStoreOptimized:
                 if action == "create":
                     # append: 追加新内容
                     self._memory.append(target_memory_file, decision["memory_update"])
+                    logger.debug("Memory created: appended to {}", target_file)
                 elif action == "merge":
                     # LLM 应返回合并后的完整内容
                     self._memory.replace(target_memory_file, decision["memory_update"])
+                    logger.debug("Memory merged: replaced {} with merged content", target_file)
                 elif action == "replace":
                     # LLM 应返回完整的新内容
                     self._memory.replace(target_memory_file, decision["memory_update"])
+                    logger.debug("Memory replaced: {} with new content", target_file)
 
             # Step 6: Update RAG index for memory changes
             if action in ("create", "merge", "replace"):
@@ -839,12 +883,11 @@ class MemoryStoreOptimized:
 
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
             logger.info(
-                "Memory consolidation done: action={}, last_consolidated={}",
-                action,
-                session.last_consolidated,
+                "Memory consolidation completed (optimized): action={}, target_file={}, last_consolidated={}",
+                action, target_file, session.last_consolidated,
             )
             return True
 
         except Exception:
-            logger.exception("Memory consolidation failed")
+            logger.exception("Memory consolidation failed with exception")
             return False

@@ -53,6 +53,14 @@ class Session:
                 sliced = sliced[i:]
                 break
 
+        # Empty history protection - add debug log for new session tracking
+        if not sliced:
+            logger.debug(
+                "Session {} has no unconsolidated messages (last_consolidated={}, total={})",
+                self.key, self.last_consolidated, len(self.messages)
+            )
+            return []
+
         out: list[dict[str, Any]] = []
         for m in sliced:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}

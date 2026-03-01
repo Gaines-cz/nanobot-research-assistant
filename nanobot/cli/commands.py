@@ -309,6 +309,7 @@ def gateway(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         memory_model=config.agents.defaults.memory_model,
+        subagent_model=config.agents.defaults.subagent_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -468,6 +469,7 @@ def agent(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         memory_model=config.agents.defaults.memory_model,
+        subagent_model=config.agents.defaults.subagent_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -520,7 +522,14 @@ def agent(
         def _exit_on_sigint(signum, frame):
             _restore_terminal()
             console.print("\nGoodbye!")
-            os._exit(0)
+
+            # 正常清理资源
+            if agent_loop:
+                agent_loop.stop()
+
+            # 使用 sys.exit 代替 os._exit，允许 finally 块执行
+            import sys
+            sys.exit(0)
 
         signal.signal(signal.SIGINT, _exit_on_sigint)
 
@@ -961,6 +970,7 @@ def cron_run(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         memory_model=config.agents.defaults.memory_model,
+        subagent_model=config.agents.defaults.subagent_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
