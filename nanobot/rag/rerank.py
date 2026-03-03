@@ -1,8 +1,9 @@
 """Reranker and deduplicator for RAG search results (Phase 4)."""
 
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Any, Optional
-import asyncio
+
 from loguru import logger
 
 

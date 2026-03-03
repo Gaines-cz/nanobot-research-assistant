@@ -21,9 +21,15 @@ class ContextBuilder:
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     MAX_SYSTEM_PROMPT_LENGTH = 8000  # 为 model 留出空间
 
-    def __init__(self, workspace: Path, embedding_provider: Optional[Any] = None):
+    def __init__(
+        self,
+        workspace: Path,
+        embedding_provider: Optional[Any] = None,
+        memory_store: Optional[MemoryStore] = None,
+    ):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace, embedding_provider)
+        # Use provided MemoryStore or create a new one
+        self.memory = memory_store if memory_store is not None else MemoryStore(workspace, embedding_provider)
         self.skills = SkillsLoader(workspace)
 
     def build_system_prompt(self, skill_names: list[str] | None = None, query: str | None = None) -> str:

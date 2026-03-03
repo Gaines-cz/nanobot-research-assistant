@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 
-
 ChunkType = Literal[
     "abstract", "introduction", "method", "experiment",
     "result", "conclusion", "lab_record", "concept_def", "other"

@@ -394,20 +394,13 @@ class TestMemoryDeduplication:
         mock_provider = AsyncMock()
         # 相似内容的 embedding（余弦相似度 > 0.8）
         similar_embedding = [0.5, 0.5, 0.5, 0.5]
-        # 不相似内容的 embedding
-        different_embedding = [1.0, 0.0, 0.0, 0.0]
 
-        call_count = [0]
+        async def mock_embed_batch(texts: list[str]) -> list[list[float]]:
+            # 批量返回所有文本的 embedding
+            # 第一个是新内容，其余是已有段落
+            return [similar_embedding] * len(texts)
 
-        async def mock_embed(text: str) -> list[float]:
-            call_count[0] += 1
-            # 第一段是已有内容，第二段是新内容
-            if call_count[0] == 1:
-                return similar_embedding  # 新内容的 embedding
-            else:
-                return similar_embedding  # 已有段落的 embedding（相似）
-
-        mock_provider.embed = mock_embed
+        mock_provider.embed_batch = mock_embed_batch
 
         store = MemoryStore(tmp_path, embedding_provider=mock_provider)
         store.append(MemoryFile.PAPERS, "这篇论文介绍了 Transformer 架构")
@@ -427,16 +420,12 @@ class TestMemoryDeduplication:
 
         mock_provider = AsyncMock()
 
-        call_count = [0]
+        async def mock_embed_batch(texts: list[str]) -> list[list[float]]:
+            # 第一个是新内容，其余是已有段落
+            # 返回不相似的 embedding
+            return [[1.0, 0.0, 0.0, 0.0]] + [[0.0, 1.0, 0.0, 0.0]] * (len(texts) - 1)
 
-        async def mock_embed(text: str) -> list[float]:
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return [1.0, 0.0, 0.0, 0.0]  # 新内容的 embedding
-            else:
-                return [0.0, 1.0, 0.0, 0.0]  # 已有段落的 embedding（不相似）
-
-        mock_provider.embed = mock_embed
+        mock_provider.embed_batch = mock_embed_batch
 
         store = MemoryStore(tmp_path, embedding_provider=mock_provider)
         store.append(MemoryFile.PAPERS, "这是一篇关于机器学习的论文")
@@ -455,7 +444,7 @@ class TestMemoryDeduplication:
         from unittest.mock import AsyncMock
 
         mock_provider = AsyncMock()
-        mock_provider.embed = AsyncMock(side_effect=Exception("Embedding failed"))
+        mock_provider.embed_batch = AsyncMock(side_effect=Exception("Embedding failed"))
 
         store = MemoryStore(tmp_path, embedding_provider=mock_provider)
         store.append(MemoryFile.PAPERS, "Existing content")

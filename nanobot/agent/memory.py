@@ -118,7 +118,7 @@ class MemoryStore:
     ):
         self.memory_dir = ensure_dir(workspace / "memory")
         self._embedding_provider = embedding_provider
-        self._rag_store = rag_store  # RAG store for memory search
+        self._rag_store = rag_store  # RAG store for memory search (enables RAG-based consolidation)
 
     # === Read Operations ===
 
@@ -205,14 +205,31 @@ class MemoryStore:
             return False
 
         try:
-            # 获取新内容的 embedding
-            content_embedding = await self._embedding_provider.embed(content)
-
-            # 将已有内容按段落分割，检查每个段落
+            # 将已有内容按段落分割
             paragraphs = [p.strip() for p in existing.split("\n\n") if p.strip()]
+            if not paragraphs:
+                return False
 
-            for para in paragraphs:
-                para_embedding = await self._embedding_provider.embed(para)
+            # 性能优化：限制最大段落数，避免批量过大
+            # 如果段落过多，只检查前 100 个段落（覆盖绝大多数场景）
+            max_paragraphs = 100
+            if len(paragraphs) > max_paragraphs:
+                logger.debug(
+                    "Paragraph count {} exceeds limit {}, truncating for performance",
+                    len(paragraphs), max_paragraphs
+                )
+                paragraphs = paragraphs[:max_paragraphs]
+
+            # 批量 embedding：一次性获取所有段落和内容的 embedding
+            # 性能提升：从 O(n) 次 API 调用降至 O(1) 次
+            all_texts = [content] + paragraphs
+            embeddings = await self._embedding_provider.embed_batch(all_texts)
+
+            content_embedding = embeddings[0]
+            para_embeddings = embeddings[1:]
+
+            # 并行计算相似度
+            for para_embedding in para_embeddings:
                 similarity = self._cosine_similarity(content_embedding, para_embedding)
                 if similarity >= threshold:
                     return True
@@ -469,11 +486,52 @@ class MemoryStore:
         *,
         archive_all: bool = False,
         memory_window: int = 50,
+        use_rag: bool = True,
     ) -> bool:
-        """Consolidate with incremental operations.
-
-        Returns True on success (including no-op), False on failure.
         """
+        Consolidate memory with incremental operations.
+
+        Two strategies available:
+        - **RAG-based** (use_rag=True): compress → RAG search → LLM decide → write.
+          More accurate for avoiding duplicates and maintaining consistency.
+        - **Direct** (use_rag=False): LLM directly decides operations.
+          Faster but may create duplicates.
+
+        Args:
+            session: Session to consolidate
+            provider: LLM provider
+            model: Model to use
+            archive_all: If True, archive all messages (default: keep recent half)
+            memory_window: Number of recent messages to keep
+            use_rag: If True, use RAG-based consolidation (requires _rag_store)
+
+        Returns:
+            True on success, False on failure
+        """
+        # Choose consolidation strategy
+        if use_rag and self._rag_store is not None:
+            return await self._consolidate_with_rag(
+                session, provider, model,
+                archive_all=archive_all, memory_window=memory_window,
+            )
+        else:
+            if use_rag and self._rag_store is None:
+                logger.warning("RAG-based consolidation requested but _rag_store is None, falling back to direct method")
+            return await self._consolidate_direct(
+                session, provider, model,
+                archive_all=archive_all, memory_window=memory_window,
+            )
+
+    async def _consolidate_direct(
+        self,
+        session: Session,
+        provider: LLMProvider,
+        model: str,
+        *,
+        archive_all: bool = False,
+        memory_window: int = 50,
+    ) -> bool:
+        """Direct consolidation: LLM directly decides operations without RAG search."""
         if archive_all:
             old_messages = session.messages
             keep_count = 0
@@ -591,6 +649,245 @@ class MemoryStore:
             logger.exception("Memory consolidation failed with exception")
             return False
 
+    async def _consolidate_with_rag(
+        self,
+        session: "Session",
+        provider: "LLMProvider",
+        model: str,
+        *,
+        archive_all: bool = False,
+        memory_window: int = 50,
+    ) -> bool:
+        """
+        RAG-based consolidation: compress → RAG search → LLM decide → write.
+
+        Flow:
+        1. Get old messages to consolidate
+        2. LLM compress into summary (5-10 key points)
+        3. RAG search related memory
+        4. LLM decide (create/merge/replace/skip)
+        5. Write to memory files
+
+        Args:
+            session: Session to consolidate
+            provider: LLM provider
+            model: Model to use
+            archive_all: If True, archive all messages
+            memory_window: Number of recent messages to keep
+
+        Returns:
+            True on success, False on failure
+        """
+        # Step 1: Get old messages
+        if archive_all:
+            old_messages = session.messages
+            keep_count = 0
+            logger.info("Memory consolidation started (RAG, archive_all): total_messages={}", len(session.messages))
+        else:
+            keep_count = memory_window // 2
+            if len(session.messages) <= keep_count:
+                logger.debug("Memory consolidation skipped (RAG): {} messages <= keep_count {}", len(session.messages), keep_count)
+                return True
+            if len(session.messages) - session.last_consolidated <= 0:
+                logger.debug("Memory consolidation skipped (RAG): no unconsolidated messages")
+                return True
+            old_messages = session.messages[session.last_consolidated:-keep_count]
+            if not old_messages:
+                logger.debug("Memory consolidation skipped (RAG): empty old_messages slice")
+                return True
+            logger.info("Memory consolidation started (RAG): total_messages={}, old_messages={}, keep_count={}",
+                        len(session.messages), len(old_messages), keep_count)
+
+        try:
+            # Step 2: LLM compress
+            logger.debug("Step 2: Compressing {} messages into summary", len(old_messages))
+            summary = await self._compress_messages(old_messages, provider, model)
+            logger.debug("Compressed summary: {}", summary[:200])
+
+            # Step 3: RAG search related memory
+            logger.debug("Step 3: Searching for related memories")
+            related_memory = await self._search_related_memory(summary, top_k=3)
+            logger.debug("Found {} related memories", len(related_memory))
+
+            # Step 4: LLM decide (always call LLM, even without related memory)
+            logger.debug("Step 4: Deciding memory action with context")
+            decision = await self._decide_with_context(summary, related_memory, provider, model)
+            logger.debug("LLM decision: action={}, target_file={}", decision.get("action"), decision.get("target_file"))
+
+            # Fallback: if LLM doesn't return target_file, infer it from summary
+            if "target_file" not in decision:
+                decision["target_file"] = self._infer_target_file(summary)
+
+            # Step 5: Write to memory
+            if decision.get("history_entry"):
+                self.append_history(decision["history_entry"])
+                logger.debug("History entry appended: {}", decision["history_entry"][:100])
+
+            action = decision.get("action", "skip")
+            target_file = decision.get("target_file", "profile")
+
+            # Map target_file string to MemoryFile enum
+            file_map = {
+                "profile": MemoryFile.PROFILE,
+                "projects": MemoryFile.PROJECTS,
+                "papers": MemoryFile.PAPERS,
+                "decisions": MemoryFile.DECISIONS,
+                "todos": MemoryFile.TODOS,
+            }
+            target_memory_file = file_map.get(target_file, MemoryFile.PROFILE)
+
+            if action in ("create", "merge", "replace") and decision.get("memory_update"):
+                if action == "create":
+                    # append: 追加新内容
+                    self.append(target_memory_file, decision["memory_update"])
+                    logger.debug("Memory created: appended to {}", target_file)
+                elif action == "merge":
+                    # LLM 应返回合并后的完整内容
+                    self.replace(target_memory_file, decision["memory_update"])
+                    logger.debug("Memory merged: replaced {} with merged content", target_file)
+                elif action == "replace":
+                    # LLM 应返回完整的新内容
+                    self.replace(target_memory_file, decision["memory_update"])
+                    logger.debug("Memory replaced: {} with new content", target_file)
+
+            # Step 6: Update RAG index for memory changes
+            if action in ("create", "merge", "replace"):
+                if not self._rag_store.config.enable_memory_index:
+                    logger.debug("Memory index update skipped (enable_memory_index=False)")
+                else:
+                    try:
+                        # Only index memory directory (efficient incremental update)
+                        await self._rag_store.scan_and_index(
+                            self.memory_dir,
+                            chunk_size=self._rag_store.config.memory_chunk_size,
+                            chunk_overlap_ratio=self._rag_store.config.memory_chunk_overlap_ratio,
+                        )
+                        logger.info("RAG memory index updated")
+                    except Exception as e:
+                        logger.warning("RAG memory index update failed: {}", e)
+
+            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
+            logger.info(
+                "Memory consolidation completed (RAG): action={}, target_file={}, last_consolidated={}",
+                action, target_file, session.last_consolidated,
+            )
+            return True
+
+        except Exception:
+            logger.exception("Memory consolidation failed with exception")
+            return False
+
+    def _format_messages(self, messages: list[dict]) -> str:
+        """Format messages for LLM processing."""
+        lines = []
+        for m in messages:
+            if not m.get("content"):
+                continue
+            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
+            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
+        return "\n".join(lines)
+
+    async def _compress_messages(self, messages: list[dict], provider: "LLMProvider", model: str) -> str:
+        """Compress messages into a summary of key points."""
+        formatted = self._format_messages(messages)
+        prompt = COMPRESSION_PROMPT.format(messages=formatted)
+
+        response = await provider.chat(
+            messages=[
+                {"role": "system", "content": "You are a memory consolidation assistant. Compress the conversation into key points."},
+                {"role": "user", "content": prompt}
+            ],
+            model=model,
+        )
+
+        return response.content
+
+    async def _search_related_memory(self, summary: str, top_k: int = 3) -> list[str]:
+        """Search for related memories using RAG."""
+        if not self._rag_store:
+            return []
+
+        try:
+            results = await self._rag_store.search_advanced(summary)
+            # Get memory_dir path for filtering (handle cross-platform)
+            memory_dir_str = str(self.memory_dir)
+            # Normalize path separators for cross-platform compatibility
+            memory_dir_str = memory_dir_str.replace("\\", "/").rstrip("/")
+
+            memory_results = []
+            memory_dir_prefix = memory_dir_str + "/"  # 确保是目录前缀
+            for r in results:
+                doc_path = r.document.path.replace("\\", "/").rstrip("/")
+                # 使用严格的路径前缀匹配，避免误匹配
+                if doc_path.startswith(memory_dir_prefix) or doc_path == memory_dir_str:
+                    memory_results.append(r.combined_content)
+
+            return memory_results[:top_k]
+        except Exception as e:
+            logger.warning("Memory search failed: {}", e)
+            return []
+
+    def _infer_target_file(self, summary: str) -> str:
+        """根据摘要内容推断目标文件类型。"""
+        summary_lower = summary.lower()
+
+        # Papers keywords
+        if any(kw in summary_lower for kw in ["论文", "paper", "arxiv", "阅读", "研究", "文献"]):
+            return "papers"
+        # Projects keywords
+        if any(kw in summary_lower for kw in ["项目", "project", "代码", "架构", "开发", "技术", "stack"]):
+            return "projects"
+        # Decisions keywords
+        if any(kw in summary_lower for kw in ["决定", "决策", "选择", "why", "因为", "原因", "instead of"]):
+            return "decisions"
+        # Todos keywords
+        if any(kw in summary_lower for kw in ["任务", "todo", "待办", "下一步", "计划", "plan", "task"]):
+            return "todos"
+        # Default to profile
+        return "profile"
+
+    async def _decide_with_context(
+        self,
+        summary: str,
+        related_memory: list[str],
+        provider: "LLMProvider",
+        model: str,
+    ) -> dict:
+        """Decide memory action with RAG search results."""
+        memory_context = "\n\n---\n\n".join([
+            f"[相关记忆 {i+1}]\n{m}"
+            for i, m in enumerate(related_memory)
+        ]) if related_memory else "（无相关记忆）"
+
+        prompt = DECISION_PROMPT.format(
+            summary=summary,
+            memory_context=memory_context,
+        )
+
+        response = await provider.chat(
+            messages=[
+                {"role": "system", "content": "You are a memory consolidation assistant. Decide how to handle the new information based on related memories."},
+                {"role": "user", "content": prompt}
+            ],
+            model=model,
+        )
+
+        # Parse JSON from response
+        content = response.content
+        json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: try to parse the whole response
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse LLM decision response")
+            return {"action": "skip", "reason": "Parse failed"}
+
 
 # === Consolidation with RAG Search Prompts ===
 
@@ -656,238 +953,3 @@ DECISION_PROMPT = """判断如何处理新信息。
 - merge 时输出**合并后的完整内容**（结合新旧内容）
 - replace 时输出文件的**完整新内容**
 - skip 时只需要 action 和 reason"""
-
-
-class MemoryStoreOptimized:
-    """Optimized MemoryStore with RAG search for consolidation."""
-
-    def __init__(self, memory_store: MemoryStore, rag_store: "DocumentStore"):
-        """Initialize with existing MemoryStore and RAG store."""
-        self._memory = memory_store
-        self._rag_store = rag_store
-
-    def _format_messages(self, messages: list[dict]) -> str:
-        """Format messages for LLM processing."""
-        lines = []
-        for m in messages:
-            if not m.get("content"):
-                continue
-            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
-        return "\n".join(lines)
-
-    async def _compress_messages(self, messages: list[dict], provider: "LLMProvider", model: str) -> str:
-        """Step 2: LLM compress messages into summary."""
-        formatted = self._format_messages(messages)
-        prompt = COMPRESSION_PROMPT.format(messages=formatted)
-
-        response = await provider.chat(
-            messages=[
-                {"role": "system", "content": "You are a memory consolidation assistant. Compress the conversation into key points."},
-                {"role": "user", "content": prompt}
-            ],
-            model=model,
-        )
-
-        return response.content
-
-    async def _search_related_memory(self, summary: str, top_k: int = 3) -> list[str]:
-        """Step 3: RAG search related memory."""
-        if not self._rag_store:
-            return []
-
-        try:
-            results = await self._rag_store.search_advanced(summary)
-            # Get memory_dir path for filtering (handle cross-platform)
-            memory_dir_str = str(self._memory.memory_dir)
-            # Normalize path separators for cross-platform compatibility
-            memory_dir_str = memory_dir_str.replace("\\", "/").rstrip("/")
-
-            memory_results = []
-            memory_dir_prefix = memory_dir_str + "/"  # 确保是目录前缀
-            for r in results:
-                doc_path = r.document.path.replace("\\", "/").rstrip("/")
-                # 使用严格的路径前缀匹配，避免误匹配
-                if doc_path.startswith(memory_dir_prefix) or doc_path == memory_dir_str:
-                    memory_results.append(r.combined_content)
-
-            return memory_results[:top_k]
-        except Exception as e:
-            logger.warning("Memory search failed: {}", e)
-            return []
-
-    def _infer_target_file(self, summary: str) -> str:
-        """根据摘要内容推断目标文件类型。"""
-        summary_lower = summary.lower()
-
-        # Papers keywords
-        if any(kw in summary_lower for kw in ["论文", "paper", "arxiv", "阅读", "研究", "文献"]):
-            return "papers"
-        # Projects keywords
-        if any(kw in summary_lower for kw in ["项目", "project", "代码", "架构", "开发", "技术", "stack"]):
-            return "projects"
-        # Decisions keywords
-        if any(kw in summary_lower for kw in ["决定", "决策", "选择", "why", "因为", "原因", "instead of"]):
-            return "decisions"
-        # Todos keywords
-        if any(kw in summary_lower for kw in ["任务", "todo", "待办", "下一步", "计划", "plan", "task"]):
-            return "todos"
-        # Default to profile
-        return "profile"
-
-    async def _decide_with_context(
-        self,
-        summary: str,
-        related_memory: list[str],
-        provider: "LLMProvider",
-        model: str,
-    ) -> dict:
-        """Step 4: LLM decide with RAG search results."""
-        memory_context = "\n\n---\n\n".join([
-            f"[相关记忆 {i+1}]\n{m}"
-            for i, m in enumerate(related_memory)
-        ]) if related_memory else "（无相关记忆）"
-
-        prompt = DECISION_PROMPT.format(
-            summary=summary,
-            memory_context=memory_context,
-        )
-
-        response = await provider.chat(
-            messages=[
-                {"role": "system", "content": "You are a memory consolidation assistant. Decide how to handle the new information based on related memories."},
-                {"role": "user", "content": prompt}
-            ],
-            model=model,
-        )
-
-        # Parse JSON from response
-        content = response.content
-        json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
-
-        # Fallback: try to parse the whole response
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse LLM decision response")
-            return {"action": "skip", "reason": "Parse failed"}
-
-    async def consolidate(
-        self,
-        session: "Session",
-        provider: "LLMProvider",
-        model: str,
-        *,
-        archive_all: bool = False,
-        memory_window: int = 50,
-    ) -> bool:
-        """
-        Optimized consolidation: compress → RAG search → LLM decide → write.
-
-        Flow:
-        1. Get old messages to consolidate
-        2. LLM compress into summary (5-10 key points)
-        3. RAG search related memory
-        4. LLM decide (create/merge/replace/skip)
-        5. Write to memory files
-        """
-        # Step 1: Get old messages
-        if archive_all:
-            old_messages = session.messages
-            keep_count = 0
-            logger.info("Memory consolidation started (optimized, archive_all): total_messages={}", len(session.messages))
-        else:
-            keep_count = memory_window // 2
-            if len(session.messages) <= keep_count:
-                logger.debug("Memory consolidation skipped (optimized): {} messages <= keep_count {}", len(session.messages), keep_count)
-                return True
-            if len(session.messages) - session.last_consolidated <= 0:
-                logger.debug("Memory consolidation skipped (optimized): no unconsolidated messages")
-                return True
-            old_messages = session.messages[session.last_consolidated:-keep_count]
-            if not old_messages:
-                logger.debug("Memory consolidation skipped (optimized): empty old_messages slice")
-                return True
-            logger.info("Memory consolidation started (optimized): total_messages={}, old_messages={}, keep_count={}",
-                        len(session.messages), len(old_messages), keep_count)
-
-        try:
-            # Step 2: LLM compress
-            logger.debug("Step 2: Compressing {} messages into summary", len(old_messages))
-            summary = await self._compress_messages(old_messages, provider, model)
-            logger.debug("Compressed summary: {}", summary[:200])
-
-            # Step 3: RAG search related memory
-            logger.debug("Step 3: Searching for related memories")
-            related_memory = await self._search_related_memory(summary, top_k=3)
-            logger.debug("Found {} related memories", len(related_memory))
-
-            # Step 4: LLM decide (always call LLM, even without related memory)
-            logger.debug("Step 4: Deciding memory action with context")
-            decision = await self._decide_with_context(summary, related_memory, provider, model)
-            logger.debug("LLM decision: action={}, target_file={}", decision.get("action"), decision.get("target_file"))
-
-            # Fallback: if LLM doesn't return target_file, infer it from summary
-            if "target_file" not in decision:
-                decision["target_file"] = self._infer_target_file(summary)
-
-            # Step 5: Write to memory
-            if decision.get("history_entry"):
-                self._memory.append_history(decision["history_entry"])
-                logger.debug("History entry appended: {}", decision["history_entry"][:100])
-
-            action = decision.get("action", "skip")
-            target_file = decision.get("target_file", "profile")
-
-            # Map target_file string to MemoryFile enum
-            file_map = {
-                "profile": MemoryFile.PROFILE,
-                "projects": MemoryFile.PROJECTS,
-                "papers": MemoryFile.PAPERS,
-                "decisions": MemoryFile.DECISIONS,
-                "todos": MemoryFile.TODOS,
-            }
-            target_memory_file = file_map.get(target_file, MemoryFile.PROFILE)
-
-            if action in ("create", "merge", "replace") and decision.get("memory_update"):
-                if action == "create":
-                    # append: 追加新内容
-                    self._memory.append(target_memory_file, decision["memory_update"])
-                    logger.debug("Memory created: appended to {}", target_file)
-                elif action == "merge":
-                    # LLM 应返回合并后的完整内容
-                    self._memory.replace(target_memory_file, decision["memory_update"])
-                    logger.debug("Memory merged: replaced {} with merged content", target_file)
-                elif action == "replace":
-                    # LLM 应返回完整的新内容
-                    self._memory.replace(target_memory_file, decision["memory_update"])
-                    logger.debug("Memory replaced: {} with new content", target_file)
-
-            # Step 6: Update RAG index for memory changes
-            if action in ("create", "merge", "replace"):
-                try:
-                    # Only index memory directory (efficient incremental update)
-                    await self._rag_store.scan_and_index(
-                        self._memory.memory_dir,
-                        chunk_size=self._rag_store.config.memory_chunk_size,
-                        chunk_overlap=self._rag_store.config.memory_chunk_overlap,
-                    )
-                    logger.info("RAG memory index updated")
-                except Exception as e:
-                    logger.warning("RAG memory index update failed: {}", e)
-
-            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
-            logger.info(
-                "Memory consolidation completed (optimized): action={}, target_file={}, last_consolidated={}",
-                action, target_file, session.last_consolidated,
-            )
-            return True
-
-        except Exception:
-            logger.exception("Memory consolidation failed with exception")
-            return False

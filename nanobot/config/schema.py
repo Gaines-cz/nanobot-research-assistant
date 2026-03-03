@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -282,7 +282,6 @@ class WebToolsConfig(Base):
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
-    timeout: int = 60
     path_append: str = ""
 
 
@@ -294,7 +293,6 @@ class MCPServerConfig(Base):
     env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
     url: str = ""  # HTTP: streamable HTTP endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP: Custom HTTP Headers
-    tool_timeout: int = 30  # Seconds before a tool call is cancelled
 
 
 # RAG default constants (extracted magic numbers for readability)
@@ -322,13 +320,13 @@ class RAGDefaults:
     RERANK_MODEL: str = "BAAI/bge-reranker-v2-m3"
     RERANK_TOP_K: int = 20
 
-    # Memory index
+    # Memory index (smaller chunks for memory files which are shorter and more conversational)
     MEMORY_CHUNK_SIZE: int = 500
-    MEMORY_CHUNK_OVERLAP: int = 50
+    MEMORY_CHUNK_OVERLAP_RATIO: float = 0.1  # 10% overlap for memory files
 
-    # Legacy/fallback
+    # Legacy/fallback (deprecated)
     CHUNK_SIZE: int = 1000
-    CHUNK_OVERLAP: int = 200
+    CHUNK_OVERLAP: int = 200  # Deprecated: use CHUNK_OVERLAP_RATIO instead
     TOP_K: int = 5
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
 
@@ -379,11 +377,11 @@ class RAGConfig(Base):
     # Memory index (for RAG + Memory integration)
     enable_memory_index: bool = True  # Include memory/ in RAG index
     memory_chunk_size: int = RAGDefaults.MEMORY_CHUNK_SIZE  # Smaller chunks for memory files
-    memory_chunk_overlap: int = RAGDefaults.MEMORY_CHUNK_OVERLAP
+    memory_chunk_overlap_ratio: float = RAGDefaults.MEMORY_CHUNK_OVERLAP_RATIO  # 10% overlap for memory files
 
-    # Legacy / fallback
-    chunk_size: int = RAGDefaults.CHUNK_SIZE
-    chunk_overlap: int = RAGDefaults.CHUNK_OVERLAP
+    # Legacy / backward compatibility (deprecated, use chunk_size and chunk_overlap_ratio)
+    chunk_size: int = RAGDefaults.CHUNK_SIZE  # Deprecated: use max_chunk_size instead
+    chunk_overlap: int | None = None  # Deprecated: use chunk_overlap_ratio instead (auto-calculated if not set)
     top_k: int = RAGDefaults.TOP_K
     embedding_model: str = RAGDefaults.EMBEDDING_MODEL  # Multi-language, good for scientific text
     auto_scan_on_startup: bool = True  # Auto-scan docs on startup
@@ -399,11 +397,11 @@ class RAGConfig(Base):
 class ToolsConfig(Base):
     """Tools configuration."""
 
+    default_tool_timeout: int = 60  # Global default timeout in seconds, 0 means no timeout
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
-    rag: RAGConfig = Field(default_factory=RAGConfig)
 
 
 class Config(BaseSettings):
@@ -414,6 +412,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    rag: RAGConfig = Field(default_factory=RAGConfig)
 
     @property
     def workspace_path(self) -> Path:

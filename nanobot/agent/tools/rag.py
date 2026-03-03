@@ -98,11 +98,11 @@ class SearchKnowledgeTool(Tool):
 
         total_stats = {"added": 0, "updated": 0, "deleted": 0}
 
-        # Index docs/
+        # Index docs/ (convert legacy chunk_overlap to ratio)
         docs_stats = await self._doc_store.scan_and_index(
             self._docs_dir,
             chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
+            chunk_overlap_ratio=self.chunk_overlap / self.chunk_size if self.chunk_size > 0 else 0.2,
         )
         for key in total_stats:
             total_stats[key] += docs_stats.get(key, 0)
@@ -112,7 +112,7 @@ class SearchKnowledgeTool(Tool):
             memory_stats = await self._doc_store.scan_and_index(
                 self._memory_dir,
                 chunk_size=self.rag_config.memory_chunk_size,
-                chunk_overlap=self.rag_config.memory_chunk_overlap,
+                chunk_overlap_ratio=self.rag_config.memory_chunk_overlap_ratio,
             )
             for key in total_stats:
                 total_stats[key] += memory_stats.get(key, 0)
@@ -129,7 +129,7 @@ class SearchKnowledgeTool(Tool):
         return await self._doc_store.scan_and_index(
             self._memory_dir,
             chunk_size=self.rag_config.memory_chunk_size,
-            chunk_overlap=self.rag_config.memory_chunk_overlap,
+            chunk_overlap_ratio=self.rag_config.memory_chunk_overlap_ratio,
         )
 
     async def execute(self, query: str, top_k: int = 5) -> str:

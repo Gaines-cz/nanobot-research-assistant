@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from loguru import logger
+
 from nanobot.config.schema import Config
 
 
@@ -36,8 +38,8 @@ def load_config(config_path: Path | None = None) -> Config:
             data = _migrate_config(data)
             return Config.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:
-            print(f"Warning: Failed to load config from {path}: {e}")
-            print("Using default configuration.")
+            logger.warning("Failed to load config from {}: {}", path, e)
+            logger.warning("Using default configuration.")
 
     return Config()
 
@@ -66,4 +68,18 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    # Migrate old memory_chunk_overlap (int) to memory_chunk_overlap_ratio (float)
+    if "tools" in data and "rag" in data["tools"]:
+        rag_cfg = data["tools"]["rag"]
+        if "memoryChunkOverlap" in rag_cfg and "memoryChunkOverlapRatio" not in rag_cfg:
+            # Convert absolute value to ratio (assuming 500 chunk size, 50 overlap = 0.1 ratio)
+            old_value = rag_cfg.pop("memoryChunkOverlap")
+            if isinstance(old_value, int) and old_value < 100:
+                # Likely an absolute value, convert to ratio
+                rag_cfg["memoryChunkOverlapRatio"] = old_value / 500  # Assume 500 chunk size
+            else:
+                # Already a ratio or large value
+                rag_cfg["memoryChunkOverlapRatio"] = old_value
+
     return data

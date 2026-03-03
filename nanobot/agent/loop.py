@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.memory import MemoryStore, MemoryStoreOptimized
+from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -29,7 +29,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, RAGConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, RAGConfig, ToolsConfig
     from nanobot.cron.service import CronService
 
 
@@ -65,8 +65,9 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         rag_config: RAGConfig | None = None,
+        tools_config: ToolsConfig | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig, RAGConfig
+        from nanobot.config.schema import ExecToolConfig, RAGConfig, ToolsConfig
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
@@ -85,6 +86,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.rag_config = rag_config or RAGConfig()
+        self.tools_config = tools_config or ToolsConfig()
 
         # Create embedding provider for memory dedup (if RAG dependencies available)
         self._embedding_provider = None
@@ -97,9 +99,12 @@ class AgentLoop:
             except ImportError:
                 logger.debug("RAG dependencies not installed, semantic dedup disabled")
 
-        self.context = ContextBuilder(workspace, self._embedding_provider)
+        # Create MemoryStore instance (shared between context builder and consolidation)
+        self._memory_store = MemoryStore(workspace, self._embedding_provider)
+
+        self.context = ContextBuilder(workspace, self._embedding_provider, memory_store=self._memory_store)
         self.sessions = session_manager or SessionManager(workspace)
-        self.tools = ToolRegistry()
+        self.tools = ToolRegistry(default_timeout=self.tools_config.default_tool_timeout)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -110,6 +115,7 @@ class AgentLoop:
             serper_api_key=serper_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            default_tool_timeout=self.tools_config.default_tool_timeout,
         )
 
         self._running = False
@@ -138,7 +144,7 @@ class AgentLoop:
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
-            timeout=self.exec_config.timeout,
+            timeout=self.tools_config.default_tool_timeout,
             restrict_to_workspace=self.restrict_to_workspace,
             path_append=self.exec_config.path_append,
         ))
@@ -154,7 +160,7 @@ class AgentLoop:
                 retrieve_tool = SearchKnowledgeTool(
                     workspace=self.workspace,
                     chunk_size=self.rag_config.chunk_size,
-                    chunk_overlap=self.rag_config.chunk_overlap,
+                    chunk_overlap=int(self.rag_config.chunk_size * self.rag_config.chunk_overlap_ratio) if self.rag_config.chunk_size > 0 else 200,
                     embedding_model=self.rag_config.embedding_model,
                     rag_config=self.rag_config,
                 )
@@ -184,7 +190,7 @@ class AgentLoop:
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack, self.tools_config.default_tool_timeout)
             self._mcp_connected = True
             self._mcp_retry_count = 0  # Reset on success
             logger.info("MCP servers connected successfully")
@@ -606,8 +612,12 @@ class AgentLoop:
         session.updated_at = datetime.now()
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
-        """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        # Try to use optimized consolidation with RAG search
+        """
+        Delegate to MemoryStore.consolidate() with RAG-based strategy.
+
+        Returns True on success, False on failure.
+        """
+        # Try to use RAG-based consolidation if RAG tool is available
         if self._retrieve_tool is not None:
             try:
                 # Ensure RAG tool is initialized
@@ -615,19 +625,21 @@ class AgentLoop:
                 rag_store = self._retrieve_tool._doc_store
 
                 if rag_store is not None:
-                    memory_store = MemoryStore(self.workspace, self._embedding_provider)
-                    optimized = MemoryStoreOptimized(memory_store, rag_store)
-                    return await optimized.consolidate(
+                    # Update the memory store's rag_store reference for RAG-based consolidation
+                    self._memory_store._rag_store = rag_store
+                    return await self._memory_store.consolidate(
                         session, self.provider, self.memory_model,
                         archive_all=archive_all, memory_window=self.memory_window,
+                        use_rag=True,  # Use RAG-based consolidation
                     )
             except Exception as e:
-                logger.warning("Optimized consolidation failed, falling back: {}", e)
+                logger.warning("RAG-based consolidation failed, falling back to direct: {}", e)
 
-        # Fallback to original MemoryStore
-        return await MemoryStore(self.workspace, self._embedding_provider).consolidate(
+        # Fallback to direct consolidation (without RAG search)
+        return await self._memory_store.consolidate(
             session, self.provider, self.memory_model,
             archive_all=archive_all, memory_window=self.memory_window,
+            use_rag=False,
         )
 
     async def process_direct(
