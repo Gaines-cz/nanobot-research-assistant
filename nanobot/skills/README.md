@@ -23,3 +23,6 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `tmux` | Remote-control tmux sessions |
 | `clawhub` | Search and install skills from ClawHub registry |
 | `skill-creator` | Create new skills |
+| `memory` | Multi-file memory system with incremental operations |
+| `paper-search` | Search and download papers to local knowledge base with RAG indexing |
+| `cron` | Schedule periodic messages and reminders |

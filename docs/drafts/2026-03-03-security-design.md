@@ -1,8 +1,8 @@
 # Nanobot 安全防护方案
 
 **日期**: 2026-03-03
-**状态**: 设计定稿
-**版本**: v1.0
+**状态**: 设计定稿（已审核）
+**版本**: v1.1
 
 ---
 
@@ -78,7 +78,7 @@ class ExecTool:
     def __init__(
         self,
         # ...
-        restrict_to_workspace: bool = True,  # 默认启用
+        restrict_to_workspace: bool = True,  # 默认启用（需从 False 修改）
     ):
         # ...
 ```
@@ -194,18 +194,29 @@ sudo chmod 700 /home/user/.config
 
 **配置 nanobot 使用低权限用户**:
 
-```python
-# nanobot/agent/tools/shell.py
-class ExecTool:
-    def __init__(
-        self,
-        # ...
-        run_as_user: str = None,  # 新增：指定运行用户
-    ):
-        self.run_as_user = run_as_user
+> ⚠️ **注意**: Python 中切换用户需要 root 权限，且会影响整个进程。
+> 建议使用以下方式之一：
+
+**方式 1: sudo 启动（推荐）**
+```bash
+sudo -u nanobot nanobot agent -m "Hello"
 ```
 
-**systemd 服务配置**（可选）:
+**方式 2: systemd 服务**
+```ini
+# /etc/systemd/system/nanobot.service
+[Service]
+User=nanobot
+Group=nanobot
+ExecStart=/usr/bin/nanobot gateway
+```
+
+**方式 3: Docker 容器**
+```dockerfile
+USER nanobot
+```
+
+**方式 4: systemd 服务配置**（可选）:
 
 ```ini
 # /etc/systemd/system/nanobot.service
@@ -251,16 +262,19 @@ class ToolsConfig(Base):
     # ... 现有配置 ...
 
     # 新增安全配置
-    restrict_to_workspace: bool = True          # 默认启用工作区限制（exec 工具）
-    workspace_path: str = "~/.nanobot/workspace"  # 工作区路径
+    restrict_to_workspace: bool = True          # 默认启用工作区限制（exec + filesystem 工具）
     use_firejail: bool = True                    # 默认启用 firejail
     firejail_net: str = "unrestricted"          # "unrestricted" | "none" | "whitelist"
-    run_as_user: str = None                     # 专用用户（可选）
 ```
 
-**⚠️ Filesystem 工具配置**:
-- `ReadFileTool`、`WriteFileTool`、`EditFileTool`、`ListDirTool` 通过 `allowed_dir` 参数统一限制为 `workspace_path`
-- 在 `AgentLoop._register_default_tools()` 中统一传入 `allowed_dir`
+**⚠️ 已存在的配置** (无需新增):
+- `AgentDefaults.workspace`: 工作区路径，默认值 `"~/.nanobot/workspace"` (schema.py:207)
+- `Config.workspace_path`: 通过 property 访问已展开的工作区路径 (schema.py:432-435)
+
+**⚠️ Filesystem 工具配置** (已实现):
+- `ReadFileTool`、`WriteFileTool`、`EditFileTool`、`ListDirTool` 已通过 `allowed_dir` 参数限制
+- `AgentLoop._register_default_tools()` 已传入 `allowed_dir` (loop.py:289-291)
+- `_resolve_path()` 函数已实现路径验证 (filesystem.py:10-21)
 
 ### 4.2 配置组合
 
@@ -301,15 +315,15 @@ nanobot agent -m "exec whoami"
 
 ## 6. 实现计划
 
-| 阶段 | 任务 | 预估时间 |
-|------|------|----------|
-| Phase 1 | 修改 `restrict_to_workspace` 默认值为 `True` | 0.5 小时 |
-| Phase 2 | 添加 `use_firejail` 配置项和执行逻辑 | 1 小时 |
-| Phase 3 | 为 filesystem 工具添加 `allowed_dir` 默认配置（~/.nanobot/workspace） | 0.5 小时 |
-| Phase 4 | 添加 `run_as_user` 配置项 | 1 小时 |
-| Phase 5 | 添加 `firejail_net` 网络控制选项 | 0.5 小时 |
-| Phase 6 | 编写安全配置脚本（创建用户、设置权限） | 0.5 小时 |
-| Phase 7 | 测试验证（exec + filesystem 工具） | 1 小时 |
+| 阶段 | 任务 | 预估时间 | 状态 |
+|------|------|----------|------|
+| Phase 1 | 修改 `restrict_to_workspace` 默认值为 `True` <br> - schema.py:410 (ToolsConfig) <br> - shell.py:21 (ExecTool) <br> - loop.py:187 (AgentLoop) | 0.5 小时 | 待实现 |
+| Phase 2 | 添加 `use_firejail` 配置项和执行逻辑 | 1 小时 | 待实现 |
+| Phase 3 | **确认** filesystem 工具 `allowed_dir` 机制已就绪 <br> - `_resolve_path()` 已实现 (filesystem.py:10-21) <br> - `allowed_dir` 已在 `AgentLoop` 传入 (loop.py:289-291) | - | 已存在 |
+| Phase 4 | **补充** `run_as_user` 作为部署建议（非代码实现）<br> - Python 切换用户需要 root 权限 <br> - 建议通过 `sudo -u nanobot` 或 systemd 配置实现 | - | 部署建议 |
+| Phase 5 | 添加 `firejail_net` 网络控制选项 | 0.5 小时 | 待实现 |
+| Phase 6 | 编写安全配置脚本（创建用户、设置权限） | 0.5 小时 | 待实现 |
+| Phase 7 | 测试验证（exec + filesystem 工具） | 1 小时 | 待实现 |
 
 ---
 
@@ -335,3 +349,35 @@ nanobot agent -m "exec whoami"
 - [Firejail 官方文档](https://firejail.wordpress.com/)
 - [Linux 用户权限最佳实践](https://www.cyberciti.biz/tips/linux-security.html)
 - [OWASP AI Security](https://owasp.org/www-project-ai-security/)
+
+---
+
+## 附录：代码审核记录
+
+**审核日期**: 2026-03-04
+
+### 已存在的功能
+
+| 功能 | 位置 | 说明 |
+|------|------|------|
+| `_resolve_path()` | `filesystem.py:10-21` | 路径解析与验证函数，已支持 `allowed_dir` 限制 |
+| `allowed_dir` 传入 | `loop.py:289-291` | `AgentLoop._register_default_tools()` 已根据 `restrict_to_workspace` 传入 `allowed_dir` |
+| `AgentDefaults.workspace` | `schema.py:207` | 工作区路径配置，默认值 `"~/.nanobot/workspace"` |
+| `Config.workspace_path` | `schema.py:432-435` | Property 方式访问已展开的工作区路径 |
+
+### 需要修改的默认值
+
+| 配置项 | 当前值 | 目标值 | 位置 |
+|--------|--------|--------|------|
+| `ToolsConfig.restrict_to_workspace` | `False` | `True` | `schema.py:410` |
+| `ExecTool.restrict_to_workspace` | `False` | `True` | `shell.py:21` |
+| `AgentLoop.restrict_to_workspace` | `False` | `True` | `loop.py:187` |
+
+### 关于 `run_as_user` 的说明
+
+经审核，在 Python 中实现运行时切换用户存在以下限制：
+1. `os.setuid()` 需要 root 权限
+2. 切换用户会影响整个进程，不适合仅用于 exec 工具
+3. 更安全的方式是在进程启动时通过 `sudo -u nanobot` 或 systemd `User=` 配置完成
+
+因此，`run_as_user` 应作为**部署建议**而非代码实现。
