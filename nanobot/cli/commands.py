@@ -170,9 +170,17 @@ def onboard():
             save_config(config)
             console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
         else:
-            config = load_config()
+            # 修复：合并旧配置和新默认配置
+            old_config = load_config()
+            new_config = Config()
+            # 用旧配置的值更新新配置（保留旧值，添加新字段）
+            old_data = old_config.model_dump(by_alias=True, exclude_unset=True)
+            new_data = new_config.model_dump(by_alias=True)
+            # 合并：旧值覆盖新默认值
+            merged_data = {**new_data, **old_data}
+            config = Config.model_validate(merged_data)
             save_config(config)
-            console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+            console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved, new fields added)")
     else:
         save_config(Config())
         console.print(f"[green]✓[/green] Created config at {config_path}")
@@ -214,12 +222,17 @@ def _create_workspace_templates(workspace: Path):
     memory_dir = workspace / "memory"
     memory_dir.mkdir(exist_ok=True)
 
-    memory_template = templates_dir / "memory" / "MEMORY.md"
-    memory_file = memory_dir / "MEMORY.md"
-    if not memory_file.exists():
-        memory_file.write_text(memory_template.read_text(encoding="utf-8"), encoding="utf-8")
-        console.print("  [dim]Created memory/MEMORY.md[/dim]")
+    # Memory files: create templates for all MemoryStore files
+    MEMORY_TEMPLATES = ["PROFILE", "PROJECTS", "PAPERS", "DECISIONS", "TODOS"]
 
+    for template_name in MEMORY_TEMPLATES:
+        template = templates_dir / "memory" / f"{template_name}.md.template"
+        dest = memory_dir / f"{template_name}.md"
+        if not dest.exists():
+            dest.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+            console.print(f"  [dim]Created memory/{template_name}.md[/dim]")
+
+    # HISTORY.md: empty file for append-only logging
     history_file = memory_dir / "HISTORY.md"
     if not history_file.exists():
         history_file.write_text("", encoding="utf-8")
@@ -322,6 +335,12 @@ def gateway(
         channels_config=config.channels,
         rag_config=config.rag,
         tools_config=config.tools,
+        # 新增：固化触发配置
+        consolidation_pause_threshold_seconds=config.agents.defaults.consolidation_pause_threshold_seconds,
+        consolidation_pause_min_messages=config.agents.defaults.consolidation_pause_min_messages,
+        consolidation_important_check_window=config.agents.defaults.consolidation_important_check_window,
+        consolidation_important_min_messages=config.agents.defaults.consolidation_important_min_messages,
+        consolidation_timeout_seconds=config.agents.defaults.consolidation_timeout_seconds,
     )
 
     # Set cron callback (needs agent)
@@ -483,6 +502,12 @@ def agent(
         channels_config=config.channels,
         rag_config=config.rag,
         tools_config=config.tools,
+        # 新增：固化触发配置
+        consolidation_pause_threshold_seconds=config.agents.defaults.consolidation_pause_threshold_seconds,
+        consolidation_pause_min_messages=config.agents.defaults.consolidation_pause_min_messages,
+        consolidation_important_check_window=config.agents.defaults.consolidation_important_check_window,
+        consolidation_important_min_messages=config.agents.defaults.consolidation_important_min_messages,
+        consolidation_timeout_seconds=config.agents.defaults.consolidation_timeout_seconds,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -986,6 +1011,12 @@ def cron_run(
         channels_config=config.channels,
         rag_config=config.rag,
         tools_config=config.tools,
+        # 新增：固化触发配置
+        consolidation_pause_threshold_seconds=config.agents.defaults.consolidation_pause_threshold_seconds,
+        consolidation_pause_min_messages=config.agents.defaults.consolidation_pause_min_messages,
+        consolidation_important_check_window=config.agents.defaults.consolidation_important_check_window,
+        consolidation_important_min_messages=config.agents.defaults.consolidation_important_min_messages,
+        consolidation_timeout_seconds=config.agents.defaults.consolidation_timeout_seconds,
     )
 
     store_path = get_data_dir() / "cron" / "jobs.json"

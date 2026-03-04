@@ -1,5 +1,6 @@
 """Search functionality for DocumentStore."""
 
+import hashlib
 import re
 import sqlite3
 
@@ -115,6 +116,23 @@ class DocumentSearch:
         # Initialize query expander
         self._query_expander = QueryExpander(enabled=self.config.enable_query_expand)
 
+    @staticmethod
+    def _get_cache_key(query: str, top_k: int | None = None) -> str:
+        """
+        生成安全的缓存 key（使用 SHA-256 哈希）。
+
+        Args:
+            query: 搜索查询
+            top_k: 可选的 top_k 参数（基础搜索使用，高级搜索不用）
+
+        Returns:
+            SHA-256 哈希值作为缓存 key
+        """
+        key_bytes = query.encode("utf-8")
+        if top_k is not None:
+            key_bytes += f":{top_k}".encode("utf-8")
+        return hashlib.sha256(key_bytes).hexdigest()
+
     async def search(
         self,
         query: str,
@@ -131,7 +149,7 @@ class DocumentSearch:
             List of SearchResult sorted by relevance
         """
         # Check cache first
-        cache_key = f"{hash(query)}:{top_k}"
+        cache_key = self._get_cache_key(query, top_k)
         if self.config.enable_search_cache:
             cached_results = self._cache_manager.basic.get(cache_key)
             if cached_results is not None:
@@ -211,7 +229,7 @@ class DocumentSearch:
         4. Cross-Encoder rerank + semantic dedup
         """
         # Check cache first
-        cache_key = f"{hash(query)}"
+        cache_key = self._get_cache_key(query)
         if self.config.enable_search_cache:
             cached_results = self._cache_manager.advanced.get(cache_key)
             if cached_results is not None:
@@ -290,11 +308,19 @@ class DocumentSearch:
         return results
 
     def _sanitize_fts_query(self, query: str) -> str:
-        """Sanitize query for FTS5, escaping special characters."""
-        special_chars = ['"', "(", ")", "*", "#", "^", "-", ":", "{", "}"]
-        sanitized = query
-        for char in special_chars:
-            sanitized = sanitized.replace(char, " ")
+        """Sanitize query for FTS5 using whitelist approach.
+
+        Only allows:
+        - Letters (a-z, A-Z)
+        - Numbers (0-9)
+        - Chinese characters (\u4e00-\u9fff)
+        - Spaces (will be normalized)
+
+        All other characters are replaced with spaces.
+        """
+        # Replace anything that's not in our whitelist with space
+        sanitized = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff]', ' ', query)
+        # Normalize multiple spaces to single space
         sanitized = re.sub(r'\s+', ' ', sanitized).strip()
         return sanitized
 

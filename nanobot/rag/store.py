@@ -54,6 +54,7 @@ class DocumentStore:
         docs_dir: Path,
         chunk_size: Optional[int] = None,
         chunk_overlap_ratio: Optional[float] = None,
+        root_path: Optional[Path] = None,
     ) -> dict[str, int]:
         """
         Scan docs_dir and index documents.
@@ -62,11 +63,34 @@ class DocumentStore:
             docs_dir: Directory to scan
             chunk_size: Optional override for max_chunk_size
             chunk_overlap_ratio: Optional override for overlap ratio
+            root_path: Optional root path to filter documents for deletion.
 
         Returns:
             Dict with counts: {"added": n, "updated": n, "deleted": n}
         """
-        return await self._indexer.scan_and_index(docs_dir, chunk_size, chunk_overlap_ratio)
+        return await self._indexer.scan_and_index(docs_dir, chunk_size, chunk_overlap_ratio, root_path)
+
+    async def index_single_file(
+        self,
+        file_path: Path,
+        chunk_size: Optional[int] = None,
+        chunk_overlap_ratio: Optional[float] = None,
+    ) -> bool:
+        """
+        索引单个文件（增量更新用）。
+
+        Args:
+            file_path: 要索引的文件路径
+            chunk_size: 可选的分块大小覆盖
+            chunk_overlap_ratio: 可选的分块重叠率覆盖
+
+        Returns:
+            True: 文件被索引（新增或更新）
+            False: 文件未变化，无需更新
+        """
+        return await self._indexer.index_single_file(
+            file_path, chunk_size, chunk_overlap_ratio
+        )
 
     async def schedule_index_update(
         self,

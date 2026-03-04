@@ -19,7 +19,7 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    MAX_SYSTEM_PROMPT_LENGTH = 8000  # 为 model 留出空间
+    MAX_SYSTEM_PROMPT_LENGTH = 12000  # 为 model 留出空间
 
     def __init__(
         self,
@@ -39,40 +39,73 @@ class ContextBuilder:
             skill_names: Optional list of skill names to load.
             query: Optional query for selective memory loading.
         """
-        parts = [self._get_identity()]
+        parts = []
+        part_names = []
 
+        # 1. Identity
+        identity = self._get_identity()
+        parts.append(identity)
+        part_names.append("identity")
+
+        # 2. Bootstrap files
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
+            part_names.append("bootstrap")
 
+        # 3. Memory
         memory = self.memory.get_memory_context(query)
         if memory:
-            parts.append(f"# Memory\n\n{memory}")
+            memory_part = f"# Memory\n\n{memory}"
+            parts.append(memory_part)
+            part_names.append("memory")
 
+        # 4. Always skills
         always_skills = self.skills.get_always_skills()
+        always_content = ""
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+                always_part = f"# Active Skills\n\n{always_content}"
+                parts.append(always_part)
+                part_names.append("always_skills")
 
+        # 5. Skills summary
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
-            parts.append(f"""# Skills
+            skills_part = f"""# Skills
 
 The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
-{skills_summary}""")
+{skills_summary}"""
+            parts.append(skills_part)
+            part_names.append("skills_summary")
 
         result = "\n\n---\n\n".join(parts)
 
+        # 记录各部分长度（用于调试）
+        if logger.level("DEBUG").no <= logger._core.min_level:
+            separator_len = len("\n\n---\n\n") * (len(parts) - 1) if len(parts) > 1 else 0
+            debug_msg = "System prompt parts breakdown: "
+            breakdown = []
+            for name, part in zip(part_names, parts):
+                breakdown.append(f"{name}={len(part)}")
+            debug_msg += ", ".join(breakdown)
+            debug_msg += f" | separators={separator_len} | total={len(result)}"
+            logger.debug(debug_msg)
+
         # Length check and truncation
         if len(result) > self.MAX_SYSTEM_PROMPT_LENGTH:
-            logger.warning(
-                "System prompt too long ({} chars > {} limit), truncating",
-                len(result),
-                self.MAX_SYSTEM_PROMPT_LENGTH
-            )
+            # 记录详细的警告信息，包括各部分长度
+            separator_len = len("\n\n---\n\n") * (len(parts) - 1) if len(parts) > 1 else 0
+            warning_msg = f"System prompt too long ({len(result)} chars > {self.MAX_SYSTEM_PROMPT_LENGTH} limit), truncating. Breakdown: "
+            breakdown = []
+            for name, part in zip(part_names, parts):
+                breakdown.append(f"{name}={len(part)}")
+            warning_msg += ", ".join(breakdown)
+            warning_msg += f" | separators={separator_len}"
+            logger.warning(warning_msg)
             result = self._truncate_system_prompt(parts, self.MAX_SYSTEM_PROMPT_LENGTH)
 
         return result

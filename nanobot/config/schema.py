@@ -214,6 +214,13 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     memory_window: int = 100
 
+    # 新增：固化触发配置
+    consolidation_pause_threshold_seconds: float = 300  # 暂停阈值（秒）
+    consolidation_pause_min_messages: int = 10  # 暂停触发最小消息数
+    consolidation_important_check_window: int = 5  # 检查最近 N 条消息的关键词
+    consolidation_important_min_messages: int = 5  # 重要内容触发最小消息数
+    consolidation_timeout_seconds: int = 90  # Memory consolidation 超时时间（秒）
+
 
 class AgentsConfig(Base):
     """Agent configuration."""
@@ -407,6 +414,14 @@ class ToolsConfig(Base):
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="ignore",  # Allow extra fields to be ignored
+        env_prefix="NANOBOT_",
+        env_nested_delimiter="__",
+    )
+
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
@@ -491,5 +506,3 @@ class Config(BaseSettings):
             if spec and spec.is_gateway and spec.default_api_base:
                 return spec.default_api_base
         return None
-
-    model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")

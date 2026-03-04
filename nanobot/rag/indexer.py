@@ -59,6 +59,7 @@ class DocumentIndexer:
         docs_dir: Path,
         chunk_size: Optional[int] = None,
         chunk_overlap_ratio: Optional[float] = None,
+        root_path: Optional[Path] = None,
     ) -> dict[str, int]:
         """
         Scan docs_dir and index documents.
@@ -67,6 +68,8 @@ class DocumentIndexer:
             docs_dir: Directory to scan
             chunk_size: Optional override for max_chunk_size
             chunk_overlap_ratio: Optional override for overlap ratio
+            root_path: Optional root path to filter documents for deletion.
+                       Only documents under this root will be considered for deletion.
 
         Returns:
             Dict with counts: {"added": n, "updated": n, "deleted": n}
@@ -83,9 +86,17 @@ class DocumentIndexer:
         db = self._db.db
         stats = {"added": 0, "updated": 0, "deleted": 0}
 
-        # Get all known documents from DB
-        cursor = db.execute("SELECT id, path, mtime, stored_at FROM documents")
+        # Get known documents from DB, filtered by root_path if provided
+        if root_path:
+            root_str = str(root_path.resolve())
+            cursor = db.execute(
+                "SELECT id, path, mtime, stored_at FROM documents WHERE path LIKE ?",
+                (f"{root_str}%",)
+            )
+        else:
+            cursor = db.execute("SELECT id, path, mtime, stored_at FROM documents")
         known_docs = {row[1]: {"id": row[0], "mtime": row[2], "stored_at": row[3]} for row in cursor}
+        logger.debug("Known docs in DB (filtered by root_path {}): {}", root_path, list(known_docs.keys()))
 
         # Scan files in docs_dir
         seen_paths: set[str] = set()
@@ -103,6 +114,7 @@ class DocumentIndexer:
             abs_path = str(file_path.resolve())
             seen_paths.add(abs_path)
             mtime = file_path.stat().st_mtime
+            logger.debug("Scanned file: {}, abs_path={}, mtime={}", file_path.name, abs_path, mtime)
 
             if abs_path not in known_docs:
                 # New document
@@ -116,14 +128,76 @@ class DocumentIndexer:
                 logger.info("Updated document: {}", file_path.name)
 
         # Delete documents that no longer exist
+        logger.debug("Seen paths during scan: {}", seen_paths)
         for path, info in known_docs.items():
             if path not in seen_paths:
+                logger.debug("Deleting doc not in seen_paths: {}, in_seen={}", path, path in seen_paths)
                 self._delete_document(db, info["id"])
                 stats["deleted"] += 1
                 logger.info("Deleted document: {}", Path(path).name)
 
         db.commit()
         return stats
+
+    async def index_single_file(
+        self,
+        file_path: Path,
+        chunk_size: Optional[int] = None,
+        chunk_overlap_ratio: Optional[float] = None,
+    ) -> bool:
+        """
+        索引单个文件（增量更新用）。
+
+        只处理给定的文件，不扫描整个目录。
+        如果文件不存在于数据库，添加它；如果已存在且 mtime 更新，更新它。
+
+        Args:
+            file_path: 要索引的文件路径
+            chunk_size: 可选的分块大小覆盖
+            chunk_overlap_ratio: 可选的分块重叠率覆盖
+
+        Returns:
+            True: 文件被索引（新增或更新）
+            False: 文件未变化，无需更新
+        """
+        if not file_path.exists() or not file_path.is_file():
+            logger.debug("File not found or not a file: {}", file_path)
+            return False
+
+        ext = file_path.suffix.lower()
+        if ext not in self.SUPPORTED_EXTENSIONS:
+            logger.debug("Unsupported file type: {}", file_path)
+            return False
+
+        db = self._db.db
+        abs_path = str(file_path.resolve())
+        mtime = file_path.stat().st_mtime
+
+        # 检查数据库中是否已有此文件
+        cursor = db.execute(
+            "SELECT id, stored_at FROM documents WHERE path = ?",
+            (abs_path,)
+        )
+        row = cursor.fetchone()
+
+        if row is None:
+            # 新文件，添加
+            await self._add_document(db, file_path, chunk_size, chunk_overlap_ratio)
+            db.commit()
+            logger.info("Added document: {}", file_path.name)
+            return True
+        else:
+            doc_id, stored_at = row
+            if mtime > stored_at:
+                # 文件已更新，更新
+                await self._update_document(db, doc_id, file_path, chunk_size, chunk_overlap_ratio)
+                db.commit()
+                logger.info("Updated document: {}", file_path.name)
+                return True
+            else:
+                # 文件未变化，跳过
+                logger.debug("File unchanged, skipping: {}", file_path.name)
+                return False
 
     async def schedule_index_update(
         self,

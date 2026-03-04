@@ -124,25 +124,16 @@ class SemanticDeduplicator:
     """
     Semantic deduplicator using embedding similarity.
 
-    Removes chunks with cosine similarity >= threshold (default 0.9).
+    Removes chunks with cosine similarity >= threshold (default matches RAGDefaults.DEDUP_THRESHOLD).
     """
 
-    def __init__(self, similarity_threshold: float = 0.9):
+    def __init__(self, similarity_threshold: float = 0.7):
         self.similarity_threshold = similarity_threshold
 
     def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
         """Calculate cosine similarity between two vectors."""
-        if len(a) != len(b):
-            return 0.0
-
-        dot_product = sum(x * y for x, y in zip(a, b))
-        norm_a = sum(x * x for x in a) ** 0.5
-        norm_b = sum(x * x for x in b) ** 0.5
-
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-
-        return dot_product / (norm_a * norm_b)
+        from nanobot.utils.helpers import cosine_similarity
+        return cosine_similarity(a, b)
 
     async def deduplicate(
         self,
@@ -188,16 +179,18 @@ class RerankService:
 
     Optimized for MacBook Pro M4 24GB:
     - Only reranks top-20 candidates
-    - Applies rerank threshold (default 0.8)
-    - Applies semantic deduplication (default 0.9)
+    - Applies rerank threshold (default matches RAGDefaults.RERANK_THRESHOLD)
+    - Applies semantic deduplication (default matches RAGDefaults.DEDUP_THRESHOLD)
+
+    NOTE: Default values here should match RAGDefaults in config/schema.py
     """
 
     def __init__(
         self,
         reranker: Optional[CrossEncoderReranker] = None,
         deduplicator: Optional[SemanticDeduplicator] = None,
-        rerank_threshold: float = 0.8,
-        dedup_threshold: float = 0.9,
+        rerank_threshold: float = 0.5,
+        dedup_threshold: float = 0.7,
         rerank_top_k: int = 20,
         enable_rerank: bool = True,
     ):

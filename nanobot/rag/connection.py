@@ -79,17 +79,14 @@ class DatabaseConnection:
         self._vector_enabled = False
         if self.embedding_provider is not None:
             try:
-                if hasattr(self._db, 'enable_load_extension'):
-                    self._db.enable_load_extension(True)
+                self._db.enable_load_extension(True)
 
-                    import sqlite_vec
+                import sqlite_vec
 
-                    ext_path = self._get_vec_extension_path(sqlite_vec)
-                    self._db.load_extension(ext_path)
-                    self._vector_enabled = True
-                    logger.debug("sqlite-vec extension loaded, vector search enabled")
-                else:
-                    logger.warning("sqlite3 does not support enable_load_extension, vector search disabled")
+                ext_path = self._get_vec_extension_path(sqlite_vec)
+                self._db.load_extension(ext_path)
+                self._vector_enabled = True
+                logger.debug("sqlite-vec extension loaded, vector search enabled")
             except Exception as e:
                 logger.warning("Could not load sqlite-vec extension, vector search disabled: {}", e)
                 self._vector_disabled_at = time.time()
@@ -157,7 +154,40 @@ class DatabaseConnection:
         # sqlite-vec virtual table for embeddings
         if self._vector_enabled:
             try:
+                import sqlite_vec
+
                 dimensions = self.embedding_provider.dimensions
+                db = self.db
+
+                # Check if we need to rebuild (by trying to insert test vector)
+                need_rebuild = False
+                cursor = db.execute("""
+                    SELECT name FROM sqlite_master
+                    WHERE type='table' AND name='chunk_embeddings'
+                """)
+                if cursor.fetchone():
+                    # Table exists, try inserting test vector
+                    try:
+                        test_embedding = [0.0] * dimensions
+                        test_blob = sqlite_vec.serialize_float32(test_embedding)
+                        db.execute("""
+                            INSERT OR IGNORE INTO chunk_embeddings (chunk_id, embedding)
+                            VALUES (?, ?)
+                        """, (-999999, test_blob))
+                        db.execute("DELETE FROM chunk_embeddings WHERE chunk_id = ?", (-999999,))
+                    except (sqlite3.OperationalError, ValueError):
+                        # Dimension mismatch, need rebuild
+                        need_rebuild = True
+
+                if need_rebuild:
+                    logger.warning(
+                        "Embedding dimension changed, rebuilding vector table "
+                        "(new: {}d)",
+                        dimensions
+                    )
+                    db.execute("DROP TABLE chunk_embeddings")
+
+                # Create table
                 db.execute(f"""
                     CREATE VIRTUAL TABLE IF NOT EXISTS chunk_embeddings USING vec0(
                         chunk_id INTEGER PRIMARY KEY,

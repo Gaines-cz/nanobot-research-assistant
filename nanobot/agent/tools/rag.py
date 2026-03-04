@@ -47,14 +47,18 @@ class SearchKnowledgeTool(Tool):
         workspace: Path,
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
-        embedding_model: str = "all-MiniLM-L6-v2",
+        embedding_model: str = "BAAI/bge-m3",
         rag_config: Optional[RAGConfig] = None,
     ):
         self.workspace = workspace
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.embedding_model = embedding_model
         self.rag_config = rag_config or RAGConfig()
+        # 如果没有显式传入 embedding_model，使用 rag_config 中的值
+        if embedding_model == "BAAI/bge-m3":
+            self.embedding_model = self.rag_config.embedding_model
+        else:
+            self.embedding_model = embedding_model
 
         self._doc_store: DocumentStore | None = None
         self._docs_dir: Path | None = None
@@ -103,6 +107,7 @@ class SearchKnowledgeTool(Tool):
             self._docs_dir,
             chunk_size=self.chunk_size,
             chunk_overlap_ratio=self.chunk_overlap / self.chunk_size if self.chunk_size > 0 else 0.2,
+            root_path=self._docs_dir,
         )
         for key in total_stats:
             total_stats[key] += docs_stats.get(key, 0)
@@ -113,6 +118,7 @@ class SearchKnowledgeTool(Tool):
                 self._memory_dir,
                 chunk_size=self.rag_config.memory_chunk_size,
                 chunk_overlap_ratio=self.rag_config.memory_chunk_overlap_ratio,
+                root_path=self._memory_dir,
             )
             for key in total_stats:
                 total_stats[key] += memory_stats.get(key, 0)
@@ -130,6 +136,7 @@ class SearchKnowledgeTool(Tool):
             self._memory_dir,
             chunk_size=self.rag_config.memory_chunk_size,
             chunk_overlap_ratio=self.rag_config.memory_chunk_overlap_ratio,
+            root_path=self._memory_dir,
         )
 
     async def execute(self, query: str, top_k: int = 5) -> str:

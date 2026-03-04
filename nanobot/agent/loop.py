@@ -33,6 +33,130 @@ if TYPE_CHECKING:
     from nanobot.cron.service import CronService
 
 
+class ConsolidationTrigger:
+    """
+    记忆固化触发检查器（混合策略）。
+
+    触发条件（满足任一即可）：
+    1. 消息窗口（保底）：未固化消息数 ≥ threshold
+    2. 会话暂停：超过 N 分钟无新消息 + 已有 M 条消息
+    3. 重要内容：最近 N 条消息含关键词 + 已有 K 条消息
+    """
+
+    # 默认配置
+    DEFAULT_WINDOW_THRESHOLD = 100
+    DEFAULT_PAUSE_THRESHOLD_SECONDS = 300  # 5 分钟
+    DEFAULT_PAUSE_MIN_MESSAGES = 10
+    DEFAULT_IMPORTANT_KEYWORDS = [
+        "决定", "decision", "结论", "conclusion",
+        "todo", "任务", "task", "计划", "plan",
+        "项目", "project", "架构", "architecture",
+        "记住", "remember", "note", "笔记"
+    ]
+    DEFAULT_IMPORTANT_CHECK_WINDOW = 5  # 检查最近 5 条
+    DEFAULT_IMPORTANT_MIN_MESSAGES = 5  # 至少有 5 条才触发
+
+    def __init__(
+        self,
+        window_threshold: int = DEFAULT_WINDOW_THRESHOLD,
+        pause_threshold_seconds: float = DEFAULT_PAUSE_THRESHOLD_SECONDS,
+        pause_min_messages: int = DEFAULT_PAUSE_MIN_MESSAGES,
+        important_keywords: list[str] | None = None,
+        important_check_window: int = DEFAULT_IMPORTANT_CHECK_WINDOW,
+        important_min_messages: int = DEFAULT_IMPORTANT_MIN_MESSAGES,
+    ):
+        self.window_threshold = window_threshold
+        self.pause_threshold_seconds = pause_threshold_seconds
+        self.pause_min_messages = pause_min_messages
+        self.important_keywords = important_keywords or self.DEFAULT_IMPORTANT_KEYWORDS
+        self.important_check_window = important_check_window
+        self.important_min_messages = important_min_messages
+
+    def should_trigger(
+        self,
+        session: Session,
+        now: float | None = None,
+    ) -> tuple[bool, str]:
+        """
+        检查是否应该触发固化。
+
+        Args:
+            session: 会话对象
+            now: 当前时间戳（用于测试）
+
+        Returns:
+            (should_trigger: bool, reason: str)
+        """
+        now = now or time.time()
+        unconsolidated = len(session.messages) - session.last_consolidated
+
+        # 条件 1：消息窗口（保底）
+        if unconsolidated >= self.window_threshold:
+            return True, f"message window reached ({unconsolidated} messages)"
+
+        # 没有未固化消息，直接返回
+        if unconsolidated == 0:
+            return False, "no unconsolidated messages"
+
+        # 条件 2：会话暂停
+        pause_reason = self._check_pause(session, unconsolidated, now)
+        if pause_reason:
+            return True, pause_reason
+
+        # 条件 3：重要内容检测
+        important_reason = self._check_important_content(session, unconsolidated)
+        if important_reason:
+            return True, important_reason
+
+        return False, "no trigger condition met"
+
+    def _check_pause(self, session: Session, unconsolidated: int, now: float) -> str | None:
+        """检查会话暂停条件。"""
+        if unconsolidated < self.pause_min_messages:
+            return None
+
+        # 获取最后一条消息的时间
+        last_message_time = self._get_last_message_time(session, now)
+        if now - last_message_time > self.pause_threshold_seconds:
+            return f"session pause ({int(now - last_message_time)}s idle)"
+
+        return None
+
+    def _check_important_content(self, session: Session, unconsolidated: int) -> str | None:
+        """检查重要内容条件。"""
+        if unconsolidated < self.important_min_messages:
+            return None
+
+        # 检查最近 N 条消息
+        start_idx = max(session.last_consolidated, len(session.messages) - self.important_check_window)
+        recent_messages = session.messages[start_idx:]
+
+        for msg in recent_messages:
+            content = msg.get("content", "").lower()
+            for kw in self.important_keywords:
+                if kw.lower() in content:
+                    return f"important content detected (keyword: {kw})"
+
+        return None
+
+    def _get_last_message_time(self, session: Session, now: float) -> float:
+        """获取最后一条消息的时间戳。"""
+        if not session.messages:
+            return now
+
+        last_msg = session.messages[-1]
+        ts_str = last_msg.get("timestamp")
+        if ts_str:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(ts_str)
+                return dt.timestamp()
+            except (ValueError, TypeError):
+                pass
+
+        return now
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -66,6 +190,12 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         rag_config: RAGConfig | None = None,
         tools_config: ToolsConfig | None = None,
+        # 新增：固化触发配置
+        consolidation_pause_threshold_seconds: float = ConsolidationTrigger.DEFAULT_PAUSE_THRESHOLD_SECONDS,
+        consolidation_pause_min_messages: int = ConsolidationTrigger.DEFAULT_PAUSE_MIN_MESSAGES,
+        consolidation_important_check_window: int = ConsolidationTrigger.DEFAULT_IMPORTANT_CHECK_WINDOW,
+        consolidation_important_min_messages: int = ConsolidationTrigger.DEFAULT_IMPORTANT_MIN_MESSAGES,
+        consolidation_timeout_seconds: int = 90,
     ):
         from nanobot.config.schema import ExecToolConfig, RAGConfig, ToolsConfig
         self.bus = bus
@@ -87,6 +217,7 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self.rag_config = rag_config or RAGConfig()
         self.tools_config = tools_config or ToolsConfig()
+        self.consolidation_timeout_seconds = consolidation_timeout_seconds
 
         # Create embedding provider for memory dedup (if RAG dependencies available)
         self._embedding_provider = None
@@ -134,6 +265,22 @@ class AgentLoop:
         self._session_locks_lock = asyncio.Lock()  # Protects _session_locks dict
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._rag_initialized = False
+
+        # 新增：固化触发配置
+        self.consolidation_pause_threshold_seconds = consolidation_pause_threshold_seconds
+        self.consolidation_pause_min_messages = consolidation_pause_min_messages
+        self.consolidation_important_check_window = consolidation_important_check_window
+        self.consolidation_important_min_messages = consolidation_important_min_messages
+
+        # 新增：触发检查器
+        self._consolidation_trigger = ConsolidationTrigger(
+            window_threshold=self.memory_window,
+            pause_threshold_seconds=self.consolidation_pause_threshold_seconds,
+            pause_min_messages=self.consolidation_pause_min_messages,
+            important_check_window=self.consolidation_important_check_window,
+            important_min_messages=self.consolidation_important_min_messages,
+        )
+
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -190,7 +337,7 @@ class AgentLoop:
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack, self.tools_config.default_tool_timeout)
+            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
             self._mcp_connected = True
             self._mcp_retry_count = 0  # Reset on success
             logger.info("MCP servers connected successfully")
@@ -523,27 +670,29 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
-        unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._get_consolidation_lock(session.key)
+        if session.key not in self._consolidating:
+            should_trigger, reason = self._consolidation_trigger.should_trigger(session)
+            if should_trigger:
+                logger.debug("Consolidation trigger: {}", reason)
+                self._consolidating.add(session.key)
+                lock = self._get_consolidation_lock(session.key)
 
-            async def _consolidate_and_unlock():
-                try:
-                    async with asyncio.timeout(60):  # 60s 超时
-                        async with lock:
-                            await self._consolidate_memory(session)
-                except asyncio.TimeoutError:
-                    logger.error("Memory consolidation timed out after 60s for session {}", session.key)
-                finally:
-                    self._consolidating.discard(session.key)
-                    self._prune_consolidation_lock(session.key, lock)
-                    _task = asyncio.current_task()
-                    if _task is not None:
-                        self._consolidation_tasks.discard(_task)
+                async def _consolidate_and_unlock():
+                    try:
+                        async with asyncio.timeout(self.consolidation_timeout_seconds):
+                            async with lock:
+                                await self._consolidate_memory(session)
+                    except asyncio.TimeoutError:
+                        logger.error("Memory consolidation timed out after {}s for session {}", self.consolidation_timeout_seconds, session.key)
+                    finally:
+                        self._consolidating.discard(session.key)
+                        self._prune_consolidation_lock(session.key, lock)
+                        _task = asyncio.current_task()
+                        if _task is not None:
+                            self._consolidation_tasks.discard(_task)
 
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_task)
+                _task = asyncio.create_task(_consolidate_and_unlock())
+                self._consolidation_tasks.add(_task)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):

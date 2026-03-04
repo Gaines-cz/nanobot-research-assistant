@@ -1,7 +1,11 @@
 """Utility functions for nanobot."""
 
+import math
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
+
+from loguru import logger
 
 
 def ensure_dir(path: Path) -> Path:
@@ -78,3 +82,28 @@ def parse_session_key(key: str) -> tuple[str, str]:
     if len(parts) != 2:
         raise ValueError(f"Invalid session key: {key}")
     return parts[0], parts[1]
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """
+    计算两个向量的余弦相似度。
+
+    Args:
+        a: 第一个向量
+        b: 第二个向量
+
+    Returns:
+        余弦相似度（0.0 到 1.0 之间），如果向量长度不匹配返回 0.0
+    """
+    if len(a) != len(b):
+        logger.warning("Embedding length mismatch: {} vs {}", len(a), len(b))
+        return 0.0
+
+    dot_product = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+
+    return dot_product / (norm_a * norm_b)

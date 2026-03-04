@@ -1,0 +1,28 @@
+# Decisions
+
+Your decision records, documenting why certain choices were made.
+
+## Decision Title
+
+**Date:** YYYY-MM-DD
+
+### Context
+
+(What situation required this decision?)
+
+### Options Considered
+
+- Option A: (description)
+- Option B: (description)
+
+### Decision
+
+(What was decided and why)
+
+### Consequences
+
+(What are the implications and trade-offs?)
+
+---
+
+*This file is automatically updated by nanobot. Add new decisions as they are made.*

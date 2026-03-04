@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,8 +21,9 @@ class Session:
     Stores messages in JSONL format for easy reading and persistence.
 
     Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
-    but does NOT modify the messages list or get_history() output.
+    The consolidation process writes summaries to memory files (PROFILE.md,
+    PROJECTS.md, PAPERS.md, DECISIONS.md, TODOS.md, HISTORY.md) but does NOT
+    modify the messages list or get_history() output.
     """
 
     key: str  # channel:chat_id
@@ -30,6 +32,10 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
+
+    # 新增：触发时机优化字段
+    last_consolidation_check: float = field(default_factory=time.time)  # 上次检查时间
+    consolidation_paused: bool = False  # 是否处于暂停检测状态
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -74,6 +80,8 @@ class Session:
         """Clear all messages and reset session to initial state."""
         self.messages = []
         self.last_consolidated = 0
+        self.last_consolidation_check = time.time()
+        self.consolidation_paused = False
         self.updated_at = datetime.now()
 
 
@@ -140,6 +148,8 @@ class SessionManager:
             metadata = {}
             created_at = None
             last_consolidated = 0
+            last_consolidation_check = time.time()
+            consolidation_paused = False
 
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -153,6 +163,8 @@ class SessionManager:
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
+                        last_consolidation_check = data.get("last_consolidation_check", time.time())
+                        consolidation_paused = data.get("consolidation_paused", False)
                     else:
                         messages.append(data)
 
@@ -161,7 +173,9 @@ class SessionManager:
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
+                last_consolidation_check=last_consolidation_check,
+                consolidation_paused=consolidation_paused
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -178,7 +192,9 @@ class SessionManager:
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
+                "last_consolidated": session.last_consolidated,
+                "last_consolidation_check": session.last_consolidation_check,
+                "consolidation_paused": session.consolidation_paused
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:
