@@ -28,6 +28,28 @@ Memory files are loaded selectively based on context:
   - `项目/project/代码/架构` → PROJECTS.md
   - `为什么/决策/why/decision` → DECISIONS.md
 
+## View Memory Status
+
+When users ask about their current memory status (e.g., "我现在记住了什么？", "查看记忆现状"), use the `exec` tool to run the CLI command:
+
+```bash
+nanobot memory status
+```
+
+For viewing a specific file:
+```bash
+nanobot memory view profile
+nanobot memory view todos
+```
+
+For searching memory content:
+```bash
+nanobot memory search "RAG"
+nanobot memory search "论文"
+```
+
+Parse the command output and summarize the results naturally for the user.
+
 ## Search Past Events
 
 ```bash

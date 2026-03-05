@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import sys
+import time
 from pathlib import Path
 
 import typer
@@ -1359,6 +1360,237 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+
+
+# ============================================================================
+# Security Commands
+# ============================================================================
+
+security_app = typer.Typer(help="Security configuration helpers")
+app.add_typer(security_app, name="security")
+
+
+@security_app.command("setup")
+def security_setup():
+    """Show instructions for setting up secure nanobot deployment."""
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    workspace = config.workspace_path
+
+    console.print(f"{__logo__} Security Setup Guide\n")
+
+    console.print("[bold]Step 1: Create dedicated user[/bold]")
+    console.print("  [dim]# Linux[/dim]")
+    console.print("  sudo useradd -r -s /bin/false -M nanobot")
+    console.print()
+    console.print("  [dim]# macOS[/dim]")
+    console.print("  sudo sysadminctl -addUser nanobot -shell /usr/bin/false -home /var/empty")
+    console.print()
+
+    console.print("[bold]Step 2: Set workspace permissions[/bold]")
+    console.print(f"  sudo mkdir -p {workspace}")
+    console.print(f"  sudo chown -R nanobot:nanobot {workspace}")
+    console.print(f"  sudo chmod 750 {workspace}")
+    console.print()
+
+    console.print("[bold]Step 3: Secure sensitive directories[/bold]")
+    console.print("  chmod 700 ~/.ssh")
+    console.print("  chmod 700 ~/.aws")
+    console.print("  chmod 700 ~/.config")
+    console.print()
+
+    console.print("[bold]Step 4: Run nanobot as nanobot user[/bold]")
+    console.print("  sudo -u nanobot nanobot agent -m \"Hello\"")
+    console.print()
+
+    console.print("[bold]Optional: Install firejail (Linux only)[/bold]")
+    console.print("  [dim]# Debian/Ubuntu[/dim]")
+    console.print("  sudo apt install firejail")
+    console.print()
+    console.print("  [dim]# RHEL/CentOS[/dim]")
+    console.print("  sudo dnf install firejail")
+    console.print()
+
+    console.print("[bold]Current Configuration[/bold]")
+    restrict_status = "[green]enabled[/green]" if config.tools.restrict_to_workspace else "[yellow]disabled[/yellow]"
+    console.print(f"  restrict_to_workspace: {restrict_status}")
+    console.print(f"  workspace: {workspace}")
+
+
+@security_app.command("status")
+def security_status():
+    """Check current security configuration."""
+    import shutil
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    workspace = config.workspace_path
+
+    console.print(f"{__logo__} Security Status\n")
+
+    # Workspace restrictions
+    restrict_status = "[green]enabled[/green]" if config.tools.restrict_to_workspace else "[yellow]disabled[/yellow]"
+    console.print(f"Workspace restriction: {restrict_status}")
+    console.print(f"  Workspace path: {workspace}")
+
+    # Workspace directory
+    if workspace.exists():
+        stat = workspace.stat()
+        console.print(f"  Exists: [green]✓[/green]")
+        console.print(f"  Permissions: {oct(stat.st_mode)[-3:]}")
+    else:
+        console.print(f"  Exists: [red]✗[/red]")
+
+    # Firejail availability
+    console.print()
+    firejail_available = shutil.which("firejail") is not None
+    firejail_status = "[green]available[/green]" if firejail_available else "[yellow]not found[/yellow]"
+    console.print(f"Firejail sandbox: {firejail_status}")
+
+    use_firejail = getattr(config.tools.exec, "use_firejail", True)
+    firejail_config = "[green]enabled[/green]" if use_firejail else "[yellow]disabled[/yellow]"
+    console.print(f"Firejail in config: {firejail_config}")
+
+    # Summary
+    console.print()
+    console.print("[bold]Security Assessment[/bold]")
+    if config.tools.restrict_to_workspace and firejail_available and use_firejail:
+        console.print("  [green]Good: Workspace restriction + firejail enabled[/green]")
+    elif config.tools.restrict_to_workspace:
+        console.print("  [yellow]Fair: Workspace restriction enabled, firejail not available[/yellow]")
+    else:
+        console.print("  [red]Poor: Workspace restriction disabled[/red]")
+
+
+# ============================================================================
+# Memory Commands
+# ============================================================================
+
+
+memory_app = typer.Typer(help="Manage memory files")
+app.add_typer(memory_app, name="memory")
+
+
+@memory_app.command("status")
+def memory_status():
+    """Show memory file status."""
+    from nanobot.config.loader import load_config
+    from nanobot.agent.memory import MemoryFile
+
+    config = load_config()
+    workspace = config.workspace_path
+    memory_dir = workspace / "memory"
+
+    console.print(f"{__logo__} Memory Status\n")
+    console.print(f"Directory: {memory_dir}\n")
+
+    if not memory_dir.exists():
+        console.print("[yellow]Memory directory not found[/yellow]")
+        raise typer.Exit(1)
+
+    # Table header
+    table = Table(title="Memory Files")
+    table.add_column("File", style="cyan")
+    table.add_column("Lines", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Last Modified")
+
+    for mf in MemoryFile:
+        path = memory_dir / mf.value
+        if path.exists():
+            stat = path.stat()
+            content = path.read_text(encoding="utf-8")
+            lines = len(content.splitlines())
+            size = stat.st_size
+            modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
+            table.add_row(mf.value, str(lines), f"{size:,}", modified)
+        else:
+            table.add_row(mf.value, "-", "-", "[dim]not found[/dim]")
+
+    console.print(table)
+
+
+@memory_app.command("view")
+def memory_view(
+    file: str = typer.Argument(..., help="Memory file to view (e.g., profile, projects, papers)"),
+):
+    """View content of a specific memory file."""
+    from nanobot.config.loader import load_config
+    from nanobot.agent.memory import MemoryFile
+
+    config = load_config()
+    workspace = config.workspace_path
+    memory_dir = workspace / "memory"
+
+    # Map common names to MemoryFile enum
+    file_map = {
+        "profile": MemoryFile.PROFILE,
+        "projects": MemoryFile.PROJECTS,
+        "papers": MemoryFile.PAPERS,
+        "decisions": MemoryFile.DECISIONS,
+        "todos": MemoryFile.TODOS,
+        "history": MemoryFile.HISTORY,
+    }
+
+    file_lower = file.lower()
+    if file_lower not in file_map:
+        console.print(f"[red]Unknown memory file: {file}[/red]")
+        console.print(f"Available: {', '.join(file_map.keys())}")
+        raise typer.Exit(1)
+
+    memory_file = file_map[file_lower]
+    path = memory_dir / memory_file.value
+
+    if not path.exists():
+        console.print(f"[yellow]{memory_file.value} is empty or not found[/yellow]")
+        raise typer.Exit(0)
+
+    content = path.read_text(encoding="utf-8")
+    console.print(f"\n[bold]{memory_file.value}[/bold]\n")
+    console.print(content if content.strip() else "[dim](empty)[/dim]")
+
+
+@memory_app.command("search")
+def memory_search(
+    query: str = typer.Argument(..., help="Search query"),
+):
+    """Search across all memory files."""
+    from nanobot.config.loader import load_config
+    from nanobot.agent.memory import MemoryFile
+
+    config = load_config()
+    workspace = config.workspace_path
+    memory_dir = workspace / "memory"
+
+    console.print(f"{__logo__} Searching memory for: [bold]{query}[/bold]\n")
+
+    results = []
+
+    for mf in MemoryFile:
+        path = memory_dir / mf.value
+        if not path.exists():
+            continue
+
+        content = path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+
+        for i, line in enumerate(lines, 1):
+            if query.lower() in line.lower():
+                results.append((mf.value, i, line.strip()))
+
+    if not results:
+        console.print("[yellow]No results found[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(f"Found {len(results)} match(es):\n")
+
+    for filename, line_num, line_content in results:
+        # Truncate long lines
+        if len(line_content) > 100:
+            line_content = line_content[:97] + "..."
+        console.print(f"[cyan]{filename}:{line_num}[/cyan]")
+        console.print(f"  {line_content}\n")
 
 
 # ============================================================================

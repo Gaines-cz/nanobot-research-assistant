@@ -226,7 +226,7 @@ SUPPORTED_EXTENSIONS = {
 2. 对比数据库中已知文档（path + mtime）
 3. 对于每个文件：
    - 新增文档：调用 _add_document()
-   - 更新文档：调用 _update_document()（先删后增）
+   - 更新文档：调用 _update_document()（先增后删，失败时保留旧文档）
    - 删除文档：调用 _delete_document()
 4. 提交事务
 ```

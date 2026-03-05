@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.rag import SearchKnowledgeTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -19,7 +20,8 @@ from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ExecToolConfig
+    from nanobot.config.schema import ExecToolConfig, RAGConfig
+    from nanobot.rag import DocumentStore
 
 
 class SubagentManager:
@@ -35,10 +37,12 @@ class SubagentManager:
         max_tokens: int = 4096,
         serper_api_key: str | None = None,
         exec_config: ExecToolConfig | None = None,
-        restrict_to_workspace: bool = False,
+        restrict_to_workspace: bool = True,
         default_tool_timeout: float = 60.0,
+        rag_config: "RAGConfig | None" = None,
+        shared_doc_store: "DocumentStore | None" = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, RAGConfig
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
@@ -49,6 +53,8 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.default_tool_timeout = default_tool_timeout
+        self.rag_config = rag_config or RAGConfig()
+        self._shared_doc_store = shared_doc_store
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -107,9 +113,34 @@ class SubagentManager:
                 timeout=self.default_tool_timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
+                use_firejail=getattr(self.exec_config, "use_firejail", True),
+                firejail_strict=getattr(self.exec_config, "firejail_strict", True),
+                firejail_options=getattr(self.exec_config, "firejail_options", None),
+                firejail_net=getattr(self.exec_config, "firejail_net", "unrestricted"),
             ))
             tools.register(WebSearchTool(api_key=self.serper_api_key))
             tools.register(WebFetchTool())
+
+            # Register RAG tool if enabled
+            if self.rag_config.enabled:
+                try:
+                    if self._shared_doc_store:
+                        retrieve_tool = SearchKnowledgeTool.from_shared_store(
+                            self._shared_doc_store,
+                            self.workspace,
+                            self.rag_config,
+                        )
+                    else:
+                        retrieve_tool = SearchKnowledgeTool(
+                            workspace=self.workspace,
+                            chunk_size=self.rag_config.max_chunk_size,
+                            chunk_overlap=int(self.rag_config.max_chunk_size * self.rag_config.chunk_overlap_ratio) if self.rag_config.max_chunk_size > 0 else 200,
+                            embedding_model=self.rag_config.embedding_model,
+                            rag_config=self.rag_config,
+                        )
+                    tools.register(retrieve_tool)
+                except ImportError as e:
+                    logger.debug("RAG dependencies not available for subagent: {}", e)
 
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)
@@ -218,6 +249,10 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         tz = _time.strftime("%Z") or "UTC"
 
+        rag_info = """
+- Search your local knowledge base (papers, notes, documents) with search_knowledge
+""" if self.rag_config.enabled else ""
+
         return f"""# Subagent
 
 ## Current Time
@@ -234,7 +269,7 @@ You are a subagent spawned by the main agent to complete a specific task.
 ## What You Can Do
 - Read and write files in the workspace
 - Execute shell commands
-- Search the web and fetch web pages
+- Search the web and fetch web pages{rag_info}
 - Complete the task thoroughly
 
 ## What You Cannot Do
@@ -257,6 +292,10 @@ When you have completed the task, provide a clear summary of your findings or ac
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         return len(tasks)
+
+    def set_shared_doc_store(self, doc_store: "DocumentStore | None") -> None:
+        """Set the shared DocumentStore for subagents."""
+        self._shared_doc_store = doc_store
 
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""

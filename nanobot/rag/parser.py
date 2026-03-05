@@ -186,7 +186,8 @@ class DocumentParser:
             re.IGNORECASE | re.DOTALL
         )
         if abstract_match:
-            abstract = abstract_match.group(1).strip()
+            abstract_group = abstract_match.group(1)
+            abstract = abstract_group.strip() if abstract_group else None
 
         return {
             "title": title,

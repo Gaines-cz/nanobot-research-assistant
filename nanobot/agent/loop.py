@@ -184,7 +184,7 @@ class AgentLoop:
         serper_api_key: str | None = None,
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
-        restrict_to_workspace: bool = False,
+        restrict_to_workspace: bool = True,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
@@ -247,6 +247,8 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             default_tool_timeout=self.tools_config.default_tool_timeout,
+            rag_config=self.rag_config,
+            shared_doc_store=None,
         )
 
         self._running = False
@@ -294,6 +296,10 @@ class AgentLoop:
             timeout=self.tools_config.default_tool_timeout,
             restrict_to_workspace=self.restrict_to_workspace,
             path_append=self.exec_config.path_append,
+            use_firejail=getattr(self.exec_config, "use_firejail", True),
+            firejail_strict=getattr(self.exec_config, "firejail_strict", True),
+            firejail_options=getattr(self.exec_config, "firejail_options", None),
+            firejail_net=getattr(self.exec_config, "firejail_net", "unrestricted"),
         ))
         self.tools.register(WebSearchTool(api_key=self.serper_api_key))
         self.tools.register(WebFetchTool())
@@ -306,8 +312,8 @@ class AgentLoop:
             try:
                 retrieve_tool = SearchKnowledgeTool(
                     workspace=self.workspace,
-                    chunk_size=self.rag_config.chunk_size,
-                    chunk_overlap=int(self.rag_config.chunk_size * self.rag_config.chunk_overlap_ratio) if self.rag_config.chunk_size > 0 else 200,
+                    chunk_size=self.rag_config.max_chunk_size,
+                    chunk_overlap=int(self.rag_config.max_chunk_size * self.rag_config.chunk_overlap_ratio) if self.rag_config.max_chunk_size > 0 else 200,
                     embedding_model=self.rag_config.embedding_model,
                     rag_config=self.rag_config,
                 )
@@ -368,11 +374,19 @@ class AgentLoop:
             return
         if not self._retrieve_tool:
             return
-        if not self.rag_config.auto_scan_on_startup:
-            self._rag_initialized = True
-            return
 
         self._rag_initialized = True
+
+        # Always ensure DocumentStore is created (for sharing with subagents)
+        # Accessing doc_store property ensures initialization
+        _ = self._retrieve_tool.doc_store
+
+        if not self.rag_config.auto_scan_on_startup:
+            # Share DocumentStore with subagents even if auto_scan is disabled
+            if self._retrieve_tool.doc_store:
+                self.subagents.set_shared_doc_store(self._retrieve_tool.doc_store)
+            return
+
         try:
             logger.info("Scanning documents for RAG...")
             stats = await self._retrieve_tool.scan_and_index()
@@ -385,6 +399,9 @@ class AgentLoop:
                 )
             else:
                 logger.info("RAG scan complete: no changes")
+            # Share DocumentStore with subagents after successful initialization
+            if self._retrieve_tool.doc_store:
+                self.subagents.set_shared_doc_store(self._retrieve_tool.doc_store)
         except Exception as e:
             logger.error("Failed to scan documents for RAG: {}", e)
 
@@ -769,9 +786,8 @@ class AgentLoop:
         # Try to use RAG-based consolidation if RAG tool is available
         if self._retrieve_tool is not None:
             try:
-                # Ensure RAG tool is initialized
-                self._retrieve_tool._ensure_initialized()
-                rag_store = self._retrieve_tool._doc_store
+                # Ensure RAG tool is initialized (doc_store property handles this)
+                rag_store = self._retrieve_tool.doc_store
 
                 if rag_store is not None:
                     # Update the memory store's rag_store reference for RAG-based consolidation

@@ -85,8 +85,8 @@ class DocumentStore:
             chunk_overlap_ratio: 可选的分块重叠率覆盖
 
         Returns:
-            True: 文件被索引（新增或更新）
-            False: 文件未变化，无需更新
+            True: 文件被成功索引（新增或更新）
+            False: 文件未变化、无效、或处理失败
         """
         return await self._indexer.index_single_file(
             file_path, chunk_size, chunk_overlap_ratio

@@ -36,7 +36,7 @@ class MemoryOperation:
     """A single memory operation."""
 
     file: MemoryFile
-    action: str  # append | prepend | update_section | replace | skip
+    action: str  # append | prepend | update_section | replace | delete_section | skip
     content: Optional[str] = None
     section: Optional[str] = None
 
@@ -68,12 +68,12 @@ _SAVE_MEMORY_TOOL = [
                                 },
                                 "action": {
                                     "type": "string",
-                                    "enum": ["append", "prepend", "update_section", "replace", "skip"],
+                                    "enum": ["append", "prepend", "update_section", "replace", "delete_section", "skip"],
                                     "description": "Operation type.",
                                 },
                                 "section": {
                                     "type": "string",
-                                    "description": "Section name for update_section action.",
+                                    "description": "Section name for update_section or delete_section action.",
                                 },
                                 "content": {
                                     "type": "string",
@@ -96,7 +96,16 @@ MEMORY_FILES_DESC = """## Memory Files
 - **projects**: Project knowledge (tech stack, architecture, progress). Semi-stable.
 - **papers**: Paper notes (papers read, key findings). Incremental, append new entries.
 - **decisions**: Decision records (why A over B). Incremental.
-- **todos**: Todo list. Frequently updated, use replace action."""
+- **todos**: Todo list. Frequently updated, use replace action.
+
+## Actions
+
+- **append**: Add content to end of file.
+- **prepend**: Add content to beginning of file.
+- **update_section**: Update or create a section (requires section name).
+- **replace**: Replace entire file content.
+- **delete_section**: Delete a section and its content (requires section name). Idempotent.
+- **skip**: Do nothing."""
 
 
 class MemoryStore:
@@ -163,7 +172,7 @@ class MemoryStore:
         # Match: ## Section Name\n...content...\n(?=##|$)
         pattern = rf"##\s+{re.escape(section)}\s*(?:\n|$)(.*?)(?=\n##\s|\Z)"
         match = re.search(pattern, content, re.DOTALL)
-        return match.group(1).strip() if match else None
+        return match.group(1).strip() if match and match.group(1) else None
 
     # === Write Operations ===
 
@@ -295,7 +304,8 @@ class MemoryStore:
             pattern = rf"##\s+{re.escape(section)}\s*(?:\n|$)(.*?)(?=\n##\s|\Z)"
             match = re.search(pattern, old_content, re.DOTALL)
             if match:
-                existing_content = match.group(1).strip()
+                existing_group = match.group(1)
+                existing_content = existing_group.strip() if existing_group else ""
                 # 跳过空 content 或看起来像 section header 的情况（regex 边界）
                 if existing_content and not existing_content.startswith("##"):
                     if existing_content == content_stripped:
@@ -328,6 +338,61 @@ class MemoryStore:
             )
             self.replace(file, old_content)
 
+    def delete_section(self, file: MemoryFile, section: str) -> bool:
+        """
+        Delete a section from a memory file.
+
+        Args:
+            file: Target memory file
+            section: Section name to delete
+
+        Returns:
+            True on success (including idempotent case where section doesn't exist),
+            False on verification failure
+        """
+        old_content = self.read_file(file)
+
+        # If file is empty, return True (idempotent)
+        if not old_content or not old_content.strip():
+            logger.debug("File {} is empty, nothing to delete", file.value)
+            return True
+
+        # Check if section exists first
+        # Pattern: match from ## Section to the next ## or end of file
+        existence_pattern = rf"##\s+{re.escape(section)}\s*(?:\n|$).*?(?=\n##\s|\Z)"
+        if not re.search(existence_pattern, old_content, flags=re.DOTALL):
+            # Section didn't exist, nothing to delete
+            logger.debug("Section '{}' not found in {}, nothing to delete", section, file.value)
+            return True
+
+        # Remove the section
+        new_content = re.sub(existence_pattern, "", old_content, flags=re.DOTALL)
+
+        # Clean up: remove extra blank lines that may result from deletion
+        new_content = re.sub(r"\n{3,}", "\n\n", new_content).strip() + "\n"
+
+        path = self.memory_dir / file.value
+        self._safe_write(path, new_content)
+
+        # Verify: section header should no longer exist
+        # Check as a proper section header (not a substring of another header)
+        verification = self.read_file(file)
+        # Pattern: match section header at start of line, with word boundary
+        # Use the same pattern logic as delete regex for consistency
+        verification_pattern = rf"^##\s+{re.escape(section)}\s*(?:\n|$)"
+        if re.search(verification_pattern, verification, re.MULTILINE):
+            logger.warning(
+                "Section delete verification failed: header still exists after write. "
+                "Section: {}, File: {}",
+                section, file.value
+            )
+            # Rollback
+            self.replace(file, old_content)
+            return False
+
+        logger.info("Deleted section '{}' from {}", section, file.value)
+        return True
+
     def replace(self, file: MemoryFile, content: str) -> None:
         """Replace entire file content."""
         path = self.memory_dir / file.value
@@ -339,8 +404,8 @@ class MemoryStore:
             return True
 
         # Validate required parameters
-        if op.action == "update_section" and not op.section:
-            logger.warning("update_section requires section parameter, skipping")
+        if op.action in ("update_section", "delete_section") and not op.section:
+            logger.warning(f"{op.action} requires section parameter, skipping")
             return False
         if op.action in ("append", "prepend", "update_section", "replace") and op.content is None:
             logger.warning(f"{op.action} requires content parameter, skipping")
@@ -370,6 +435,9 @@ class MemoryStore:
             self.update_section(op.file, op.section, op.content)
         elif op.action == "replace":
             self.replace(op.file, op.content)
+        elif op.action == "delete_section":
+            if not self.delete_section(op.file, op.section):
+                return False
 
         return True
 

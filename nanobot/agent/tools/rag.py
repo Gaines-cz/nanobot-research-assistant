@@ -100,17 +100,17 @@ class SearchKnowledgeTool(Tool):
         if include_memory is None:
             include_memory = self.rag_config.enable_memory_index
 
-        total_stats = {"added": 0, "updated": 0, "deleted": 0}
+        total_stats = {"added": 0, "updated": 0, "deleted": 0, "skipped": 0}
 
         # Index docs/ (convert legacy chunk_overlap to ratio)
         docs_stats = await self._doc_store.scan_and_index(
             self._docs_dir,
-            chunk_size=self.chunk_size,
-            chunk_overlap_ratio=self.chunk_overlap / self.chunk_size if self.chunk_size > 0 else 0.2,
+            chunk_size=self.rag_config.max_chunk_size,
+            chunk_overlap_ratio=self.rag_config.chunk_overlap_ratio,
             root_path=self._docs_dir,
         )
-        for key in total_stats:
-            total_stats[key] += docs_stats.get(key, 0)
+        for key in docs_stats:
+            total_stats[key] = total_stats.get(key, 0) + docs_stats[key]
 
         # Index memory/ (with smaller chunks since memory files are typically small)
         if include_memory:
@@ -120,8 +120,8 @@ class SearchKnowledgeTool(Tool):
                 chunk_overlap_ratio=self.rag_config.memory_chunk_overlap_ratio,
                 root_path=self._memory_dir,
             )
-            for key in total_stats:
-                total_stats[key] += memory_stats.get(key, 0)
+            for key in memory_stats:
+                total_stats[key] = total_stats.get(key, 0) + memory_stats[key]
 
         return total_stats
 
@@ -213,8 +213,38 @@ class SearchKnowledgeTool(Tool):
         assert self._doc_store is not None
         return self._doc_store.is_vector_enabled()
 
+    @property
+    def doc_store(self) -> "DocumentStore | None":
+        """Get the underlying DocumentStore (read-only)."""
+        self._ensure_initialized()
+        return self._doc_store
+
     def close(self) -> None:
         """Close the document store connection."""
         if self._doc_store is not None:
             self._doc_store.close()
             self._doc_store = None
+
+    @classmethod
+    def from_shared_store(
+        cls,
+        doc_store: "DocumentStore",
+        workspace: Path,
+        rag_config: "RAGConfig",
+    ) -> "SearchKnowledgeTool":
+        """Create tool with shared DocumentStore (no new embedding model)."""
+        # Use normal __init__ for proper initialization
+        tool = cls(
+            workspace=workspace,
+            chunk_size=rag_config.max_chunk_size,
+            chunk_overlap=int(rag_config.max_chunk_size * rag_config.chunk_overlap_ratio) if rag_config.max_chunk_size > 0 else 200,
+            embedding_model=rag_config.embedding_model,
+            rag_config=rag_config,
+        )
+        # Replace doc_store with shared instance
+        tool._doc_store = doc_store
+        # Set directory paths that would be created in _ensure_initialized
+        tool._docs_dir = workspace / "docs"
+        tool._memory_dir = workspace / "memory"
+        tool._rag_dir = workspace / "rag"
+        return tool

@@ -290,6 +290,10 @@ class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
     path_append: str = ""
+    use_firejail: bool = True  # Use firejail sandbox for exec commands (Linux only)
+    firejail_strict: bool = True  # If true, fail instead of falling back to no sandbox
+    firejail_options: list[str] | None = None  # Custom firejail options
+    firejail_net: str = "unrestricted"  # Network mode: "unrestricted" | "none" | "whitelist"
 
 
 class MCPServerConfig(Base):
@@ -407,7 +411,7 @@ class ToolsConfig(Base):
     default_tool_timeout: int = 60  # Global default timeout in seconds, 0 means no timeout
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
+    restrict_to_workspace: bool = True  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
