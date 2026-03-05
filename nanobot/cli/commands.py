@@ -440,8 +440,8 @@ def gateway(
             console.print("\nShutting down...")
         finally:
             await agent.close_mcp()
-            heartbeat.stop()
-            cron.stop()
+            await heartbeat.stop()
+            await cron.stop()
             agent.stop()
             await channels.stop_all()
 

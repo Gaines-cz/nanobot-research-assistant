@@ -73,6 +73,7 @@ class CronService:
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
+        self._tasks: set[asyncio.Task] = set()
 
     def _load_store(self) -> CronStore:
         """Load jobs from disk."""
@@ -174,12 +175,30 @@ class CronService:
         self._arm_timer()
         logger.info("Cron service started with {} jobs", len(self._store.jobs if self._store else []))
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """Stop the cron service."""
         self._running = False
         if self._timer_task:
             self._timer_task.cancel()
+            try:
+                await self._timer_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Error waiting for cron timer task: {}", e)
             self._timer_task = None
+
+        # Wait for all tasks to complete
+        for task in list(self._tasks):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error("Error waiting for cron task: {}", e)
+        self._tasks.clear()
 
     def _recompute_next_runs(self) -> None:
         """Recompute next run times for all enabled jobs."""
@@ -211,11 +230,19 @@ class CronService:
         delay_s = delay_ms / 1000
 
         async def tick():
-            await asyncio.sleep(delay_s)
-            if self._running:
-                await self._on_timer()
+            try:
+                await asyncio.sleep(delay_s)
+                if self._running:
+                    await self._on_timer()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Cron timer task failed: {}", e, exc_info=True)
 
-        self._timer_task = asyncio.create_task(tick())
+        _task = asyncio.create_task(tick())
+        _task.add_done_callback(lambda t: self._tasks.discard(t))
+        self._tasks.add(_task)
+        self._timer_task = _task
 
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
@@ -240,9 +267,8 @@ class CronService:
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
 
         try:
-            response = None
             if self.on_job:
-                response = await self.on_job(job)
+                await self.on_job(job)
 
             job.state.last_status = "ok"
             job.state.last_error = None

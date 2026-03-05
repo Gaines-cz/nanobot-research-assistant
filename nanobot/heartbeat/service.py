@@ -69,6 +69,7 @@ class HeartbeatService:
         self.enabled = enabled
         self._running = False
         self._task: asyncio.Task | None = None
+        self._tasks: set[asyncio.Task] = set()
 
     @property
     def heartbeat_file(self) -> Path:
@@ -121,15 +122,36 @@ class HeartbeatService:
             return
 
         self._running = True
-        self._task = asyncio.create_task(self._run_loop())
+        _task = asyncio.create_task(self._run_loop())
+        _task.add_done_callback(lambda t: self._tasks.discard(t))
+        self._tasks.add(_task)
+        self._task = _task
         logger.info("Heartbeat started (every {}s)", self.interval_s)
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """Stop the heartbeat service."""
         self._running = False
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Error waiting for heartbeat task: {}", e)
             self._task = None
+
+        # Clean up all tasks
+        for task in list(self._tasks):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error("Error waiting for heartbeat task: {}", e)
+        self._tasks.clear()
 
     async def _run_loop(self) -> None:
         """Main heartbeat loop."""

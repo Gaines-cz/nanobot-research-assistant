@@ -37,7 +37,7 @@ async def test_start_is_idempotent(tmp_path) -> None:
 
     assert service._task is first_task
 
-    service.stop()
+    await service.stop()
     await asyncio.sleep(0)
 
 

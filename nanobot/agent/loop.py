@@ -263,6 +263,7 @@ class AgentLoop:
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
+        self._consolidating_set_lock = asyncio.Lock()  # Protects _consolidating set
         self._session_locks: dict[str, asyncio.Lock] = {}  # Per-session locks for message processing
         self._session_locks_lock = asyncio.Lock()  # Protects _session_locks dict
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
@@ -656,7 +657,8 @@ class AgentLoop:
         cmd = msg.content.strip().lower()
         if cmd == "/new":
             lock = self._get_consolidation_lock(session.key)
-            self._consolidating.add(session.key)
+            async with self._consolidating_set_lock:
+                self._consolidating.add(session.key)
             try:
                 async with lock:
                     snapshot = session.messages[session.last_consolidated:]
@@ -675,7 +677,8 @@ class AgentLoop:
                     content="Memory archival failed, session not cleared. Please try again.",
                 )
             finally:
-                self._consolidating.discard(session.key)
+                async with self._consolidating_set_lock:
+                    self._consolidating.discard(session.key)
                 self._prune_consolidation_lock(session.key, lock)
 
             session.clear()
@@ -687,29 +690,38 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
-        if session.key not in self._consolidating:
-            should_trigger, reason = self._consolidation_trigger.should_trigger(session)
-            if should_trigger:
-                logger.debug("Consolidation trigger: {}", reason)
-                self._consolidating.add(session.key)
-                lock = self._get_consolidation_lock(session.key)
+        trigger_consolidation = False
+        async with self._consolidating_set_lock:
+            if session.key not in self._consolidating:
+                should_trigger, reason = self._consolidation_trigger.should_trigger(session)
+                if should_trigger:
+                    logger.debug("Consolidation trigger: {}", reason)
+                    self._consolidating.add(session.key)
+                    trigger_consolidation = True
 
-                async def _consolidate_and_unlock():
-                    try:
-                        async with asyncio.timeout(self.consolidation_timeout_seconds):
-                            async with lock:
-                                await self._consolidate_memory(session)
-                    except asyncio.TimeoutError:
-                        logger.error("Memory consolidation timed out after {}s for session {}", self.consolidation_timeout_seconds, session.key)
-                    finally:
+        if trigger_consolidation:
+            lock = self._get_consolidation_lock(session.key)
+
+            async def _consolidate_and_unlock():
+                try:
+                    async with asyncio.timeout(self.consolidation_timeout_seconds):
+                        async with lock:
+                            await self._consolidate_memory(session)
+                    logger.info("Memory consolidation completed for session {}", session.key)
+                except asyncio.TimeoutError:
+                    logger.error("Memory consolidation timed out after {}s for session {}",
+                                 self.consolidation_timeout_seconds, session.key)
+                except Exception as e:
+                    logger.error("Memory consolidation failed for session {}: {}",
+                                 session.key, e, exc_info=True)
+                finally:
+                    async with self._consolidating_set_lock:
                         self._consolidating.discard(session.key)
-                        self._prune_consolidation_lock(session.key, lock)
-                        _task = asyncio.current_task()
-                        if _task is not None:
-                            self._consolidation_tasks.discard(_task)
+                    self._prune_consolidation_lock(session.key, lock)
 
-                _task = asyncio.create_task(_consolidate_and_unlock())
-                self._consolidation_tasks.add(_task)
+            _task = asyncio.create_task(_consolidate_and_unlock())
+            _task.add_done_callback(lambda task: self._consolidation_tasks.discard(task))
+            self._consolidation_tasks.add(_task)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
