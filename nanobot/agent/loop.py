@@ -7,6 +7,7 @@ import json
 import re
 import time
 from contextlib import AsyncExitStack
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -148,7 +149,6 @@ class ConsolidationTrigger:
         ts_str = last_msg.get("timestamp")
         if ts_str:
             try:
-                from datetime import datetime
                 dt = datetime.fromisoformat(ts_str)
                 return dt.timestamp()
             except (ValueError, TypeError):
@@ -394,8 +394,8 @@ class AgentLoop:
             total = stats["added"] + stats["updated"]
             if total > 0:
                 logger.info(
-                    "RAG scan complete: +{} updated, -{} deleted",
-                    stats["added"] + stats["updated"],
+                    "RAG scan complete: +{} added/updated, -{} deleted",
+                    total,
                     stats["deleted"],
                 )
             else:
@@ -770,7 +770,6 @@ class AgentLoop:
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
-        from datetime import datetime
         for m in messages[skip:]:
             entry = {k: v for k, v in m.items() if k != "reasoning_content"}
             if entry.get("role") == "tool" and isinstance(entry.get("content"), str):
@@ -789,7 +788,7 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
+    async def _consolidate_memory(self, session: Session, archive_all: bool = False) -> bool:
         """
         Delegate to MemoryStore.consolidate() with RAG-based strategy.
 
