@@ -67,11 +67,12 @@ class SearchCache(Generic[T]):
             key: Cache key
             value: Value to cache
         """
-        # Cleanup before adding (evict if necessary)
-        self._cleanup()
+        # Insert first, then cleanup (avoids just-cleaned entry being reinserted)
         self._cache[key] = (time.time(), value)
         # Move to end (most recently used)
         self._cache.move_to_end(key)
+        # Cleanup after adding (evict if necessary)
+        self._cleanup()
 
     def clear(self) -> None:
         """Clear all cache entries."""

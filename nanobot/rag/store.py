@@ -1,27 +1,24 @@
-"""Document store facade - orchestrates connection, indexing, and search."""
+"""Document store facade - orchestrates connection, indexing, and search.
+
+This is the main entry point for the RAG system. It delegates to:
+- IndexingPipeline: For document parsing, chunking, and indexing
+- AdvancedSearchPipeline: For search with context expansion and reranking
+"""
 
 from pathlib import Path
 from typing import Any, Optional
 
 from nanobot.config.schema import RAGConfig
-from nanobot.rag.connection import DatabaseConnection
 from nanobot.rag.embeddings import EmbeddingProvider
-from nanobot.rag.indexer import DocumentIndexer
-from nanobot.rag.search import (
-    DocumentSearch,
-    SearchResult,
-    SearchResultWithContext,
-)
+from nanobot.rag.indexing.indexer import DocumentIndexer
+from nanobot.rag.models import SearchResult, SearchResultWithContext
+from nanobot.rag.retrieval.pipeline import AdvancedSearchPipeline
+from nanobot.rag.storage.connection import DatabaseConnection
 
 
 class DocumentStore:
     """
     Unified document store facade.
-
-    Delegates to:
-    - DatabaseConnection: Connection management and schema
-    - DocumentIndexer: Document indexing operations
-    - DocumentSearch: Search operations
 
     Uses:
     - SQLite for metadata storage
@@ -45,14 +42,15 @@ class DocumentStore:
         # Initialize sub-modules
         self._connection = DatabaseConnection(db_path, embedding_provider, config)
         self._indexer = DocumentIndexer(self._connection, embedding_provider, config)
-        self._search = DocumentSearch(self._connection, embedding_provider, config)
+        self._search_pipeline = AdvancedSearchPipeline(self._connection, embedding_provider, config)
 
     # === Indexing Operations ===
 
     async def scan_and_index(
         self,
         docs_dir: Path,
-        chunk_size: Optional[int] = None,
+        min_chunk_size: Optional[int] = None,
+        max_chunk_size: Optional[int] = None,
         chunk_overlap_ratio: Optional[float] = None,
         root_path: Optional[Path] = None,
     ) -> dict[str, int]:
@@ -61,45 +59,53 @@ class DocumentStore:
 
         Args:
             docs_dir: Directory to scan
-            chunk_size: Optional override for max_chunk_size
+            min_chunk_size: Optional override for min_chunk_size
+            max_chunk_size: Optional override for max_chunk_size
             chunk_overlap_ratio: Optional override for overlap ratio
             root_path: Optional root path to filter documents for deletion.
+                       Only documents under this root will be considered for deletion.
 
         Returns:
             Dict with counts: {"added": n, "updated": n, "deleted": n}
         """
-        return await self._indexer.scan_and_index(docs_dir, chunk_size, chunk_overlap_ratio, root_path)
+        return await self._indexer.scan_and_index(
+            docs_dir, min_chunk_size, max_chunk_size, chunk_overlap_ratio, root_path
+        )
 
     async def index_single_file(
         self,
         file_path: Path,
-        chunk_size: Optional[int] = None,
+        min_chunk_size: Optional[int] = None,
+        max_chunk_size: Optional[int] = None,
         chunk_overlap_ratio: Optional[float] = None,
     ) -> bool:
         """
-        索引单个文件（增量更新用）。
+        Index a single file (for incremental updates).
 
         Args:
-            file_path: 要索引的文件路径
-            chunk_size: 可选的分块大小覆盖
-            chunk_overlap_ratio: 可选的分块重叠率覆盖
+            file_path: File path to index
+            min_chunk_size: Optional override for min chunk size
+            max_chunk_size: Optional override for max chunk size
+            chunk_overlap_ratio: Optional override for overlap ratio
 
         Returns:
-            True: 文件被成功索引（新增或更新）
-            False: 文件未变化、无效、或处理失败
+            True if file was indexed (added or updated), False otherwise
         """
         return await self._indexer.index_single_file(
-            file_path, chunk_size, chunk_overlap_ratio
+            file_path, min_chunk_size, max_chunk_size, chunk_overlap_ratio
         )
 
     async def schedule_index_update(
         self,
         docs_dir: Path,
-        chunk_size: Optional[int] = None,
+        min_chunk_size: Optional[int] = None,
+        max_chunk_size: Optional[int] = None,
         chunk_overlap_ratio: Optional[float] = None,
     ) -> None:
         """Schedule an index update after a delay to batch multiple changes."""
-        await self._indexer.schedule_index_update(docs_dir, chunk_size, chunk_overlap_ratio)
+        await self._indexer.schedule_index_update(
+            docs_dir, min_chunk_size, max_chunk_size, chunk_overlap_ratio
+        )
 
     # === Search Operations ===
 
@@ -109,7 +115,7 @@ class DocumentStore:
         top_k: int = 5,
     ) -> list[SearchResult]:
         """
-        Hybrid search: vector + full-text with RRF reranking.
+        Basic hybrid search (vector + full-text).
 
         Args:
             query: Search query
@@ -118,24 +124,25 @@ class DocumentStore:
         Returns:
             List of SearchResult sorted by relevance
         """
-        return await self._search.search(query, top_k)
+        return await self._search_pipeline.search(query, top_k)
 
-    async def search_advanced(self, query: str) -> list[SearchResultWithContext]:
+    async def search_advanced(self, query: str, top_k: Optional[int] = None) -> list[SearchResultWithContext]:
         """
         Advanced multi-step search pipeline.
 
-        1. Core chunk recall (BM25 + vector, dual thresholds, Top5)
+        1. Core chunk recall (BM25 + vector, dual thresholds, TopK)
         2. Context expansion (prev1 + core + next1)
         3. Document-level prioritization (Top3 docs)
         4. Cross-Encoder rerank + semantic dedup
 
         Args:
             query: Search query
+            top_k: Number of results to return (default: None, uses pipeline defaults)
 
         Returns:
             List of SearchResultWithContext with expanded context
         """
-        return await self._search.search_advanced(query)
+        return await self._search_pipeline.search_advanced(query, top_k=top_k)
 
     # === Statistics ===
 
@@ -185,4 +192,9 @@ class DocumentStore:
 
     def clear_cache(self) -> None:
         """Clear search cache."""
-        self._search.clear_cache()
+        self._search_pipeline.clear_cache()
+
+    @property
+    def connection(self) -> DatabaseConnection:
+        """Get database connection (for evaluation module)."""
+        return self._connection

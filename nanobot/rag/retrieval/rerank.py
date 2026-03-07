@@ -1,4 +1,8 @@
-"""Reranker and deduplicator for RAG search results (Phase 4)."""
+"""Reranker and deduplicator for RAG search results.
+
+This module provides reranking and deduplication functionality,
+moved from the original rerank.py file.
+"""
 
 import asyncio
 from abc import ABC, abstractmethod
@@ -175,7 +179,7 @@ class SemanticDeduplicator:
 
 class RerankService:
     """
-    Combined reranking and deduplication service (Phase 4).
+    Combined reranking and deduplication service.
 
     Optimized for MacBook Pro M4 24GB:
     - Only reranks top-20 candidates
@@ -229,14 +233,20 @@ class RerankService:
         reranked_indices: list[tuple[int, float]] = []
         if self.enable_rerank and len(candidates) > 0:
             # Take top candidates to rerank (already sorted by score from merge step)
-            rerank_candidates = candidate_texts[:self.rerank_top_k]
+            # 同时保存原始索引: (original_idx, text)
+            # 先 enumerate 再切片，确保保存的是原始索引
+            rerank_candidates_with_idx = [
+                (i, text)
+                for i, text in enumerate(candidate_texts)
+            ][:self.rerank_top_k]
+            rerank_candidates = [text for _, text in rerank_candidates_with_idx]
             rerank_results = await self.reranker.rerank(query, rerank_candidates)
 
             if rerank_results:
                 # Map back to original indices with scores
                 reranked_indices = []
                 for rerank_idx, score in rerank_results:
-                    original_idx = rerank_idx
+                    original_idx = rerank_candidates_with_idx[rerank_idx][0]
                     reranked_indices.append((original_idx, score))
 
         # If no rerank results or disabled, use original order with dummy scores

@@ -2,6 +2,10 @@
 
 Your research direction, preferences, and personal information.
 
+IMPORTANT: This file is for YOU (the user), NOT for the AI assistant.
+- DO NOT store AI configuration here (model names, versions, etc.)
+- DO store your personal preferences, research interests, and background
+
 ## Research Direction
 
 (Describe your research interests and goals)

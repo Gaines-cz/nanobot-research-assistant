@@ -92,10 +92,15 @@ _SAVE_MEMORY_TOOL = [
 
 MEMORY_FILES_DESC = """## Memory Files
 
-- **profile**: User profile (research direction, preferences). Stable, rarely changes.
-- **projects**: Project knowledge (tech stack, architecture, progress). Semi-stable.
-- **papers**: Paper notes (papers read, key findings). Incremental, append new entries.
-- **decisions**: Decision records (why A over B). Incremental.
+IMPORTANT: These files are for USER-related content only. DO NOT store AI assistant configuration here.
+
+- **profile**: USER profile - user's research direction, preferences, technical background. Stable, rarely changes.
+  ❌ DO NOT store: AI name, model configuration, version info
+  ✅ Store: User's research interests, preferred tools, background
+
+- **projects**: Project knowledge - tech stack, architecture, progress. Semi-stable.
+- **papers**: Paper notes - papers read, key findings. Incremental, append new entries.
+- **decisions**: Decision records - why A over B. Incremental.
 - **todos**: Todo list. Frequently updated, use replace action.
 
 ## Actions
@@ -118,6 +123,8 @@ class MemoryStore:
         "decisions": MemoryFile.DECISIONS,
         "todos": MemoryFile.TODOS,
     }
+
+    MAX_MEMORY_FILE_LENGTH = 3000  # 单个 memory 文件最大长度
 
     def __init__(
         self,
@@ -509,52 +516,44 @@ class MemoryStore:
         """
         Get memory context for system prompt.
 
-        If query is provided, load relevant files based on keywords.
-        Otherwise, load PROFILE + TODOS by default.
+        Only PROFILE and TODOS are loaded by default. Other memory files
+        (PAPERS, PROJECTS, DECISIONS) are NOT loaded into the system prompt -
+        the LLM should use the read_file tool to access them when needed.
         """
         parts = []
         loaded_files = []
+        max_file_length = self.MAX_MEMORY_FILE_LENGTH
 
-        # Always load profile
+        def truncate_content(content: str, max_len: int) -> str:
+            """Truncate content if too long, add notice at end."""
+            if len(content) <= max_len:
+                return content
+            # 优先保留开头和结尾，中间截断
+            keep_start = int(max_len * 0.6)
+            keep_end = int(max_len * 0.3)
+            truncated = (
+                content[:keep_start]
+                + f"\n\n... [truncated, {len(content) - keep_start - keep_end} chars omitted] ...\n\n"
+                + content[-keep_end:]
+            )
+            return truncated
+
+        # Always load profile - user's preferences and research direction
         profile = self.read_file(MemoryFile.PROFILE)
         if profile:
-            parts.append(f"## Profile\n{profile}")
-            loaded_files.append(f"profile={len(profile)}")
+            profile_truncated = truncate_content(profile, max_file_length)
+            parts.append(f"## Profile\n{profile_truncated}")
+            loaded_files.append(f"profile={len(profile_truncated)}")
 
-        # Load todos by default (current tasks)
+        # Always load todos - current tasks
         todos = self.read_file(MemoryFile.TODOS)
         if todos:
-            parts.append(f"## Current Tasks\n{todos}")
-            loaded_files.append(f"todos={len(todos)}")
+            todos_truncated = truncate_content(todos, max_file_length)
+            parts.append(f"## Current Tasks\n{todos_truncated}")
+            loaded_files.append(f"todos={len(todos_truncated)}")
 
-        # Query-based loading
-        if query:
-            query_lower = query.lower()
-
-            # Papers: more specific triggers to avoid false positives
-            paper_kws = [
-                "论文", "paper", "papers", "arxiv", "文献",
-                "read paper", "论文笔记", "paper note", "文章"
-            ]
-            if any(kw in query_lower for kw in paper_kws):
-                papers = self.read_file(MemoryFile.PAPERS)
-                if papers:
-                    parts.append(f"## Paper Notes\n{papers}")
-                    loaded_files.append(f"papers={len(papers)}")
-
-            # Projects
-            if any(kw in query_lower for kw in ["项目", "project", "代码", "架构"]):
-                projects = self.read_file(MemoryFile.PROJECTS)
-                if projects:
-                    parts.append(f"## Projects\n{projects}")
-                    loaded_files.append(f"projects={len(projects)}")
-
-            # Decisions
-            if any(kw in query_lower for kw in ["为什么", "决策", "why did i", "为什么选", "为什么决定"]):
-                decisions = self.read_file(MemoryFile.DECISIONS)
-                if decisions:
-                    parts.append(f"## Decisions\n{decisions}")
-                    loaded_files.append(f"decisions={len(decisions)}")
+        # NOTE: PAPERS, PROJECTS, DECISIONS are NOT loaded here!
+        # The LLM should use read_file tool to access them when needed.
 
         result = "\n\n---\n\n".join(parts) if parts else ""
 
@@ -719,7 +718,8 @@ class MemoryStore:
                             file_path = self.memory_dir / target_memory_file.value
                             await self._rag_store.index_single_file(
                                 file_path,
-                                chunk_size=self._rag_store.config.memory_chunk_size,
+                                min_chunk_size=self._rag_store.config.memory_chunk_size // 2,
+                                max_chunk_size=self._rag_store.config.memory_chunk_size,
                                 chunk_overlap_ratio=self._rag_store.config.memory_chunk_overlap_ratio,
                             )
                             logger.info("RAG memory index updated for: {}", target_memory_file.value)
@@ -785,6 +785,66 @@ class MemoryStore:
                 archive_all=archive_all, memory_window=memory_window,
             )
 
+    async def _call_save_memory_with_retry(
+        self,
+        prompt: str,
+        provider: LLMProvider,
+        model: str,
+        base_system_prompt: str = "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
+    ) -> tuple[dict, list[dict]] | None:
+        """
+        Call LLM with save_memory tool with retry logic.
+
+        Args:
+            prompt: The user prompt to send
+            provider: LLM provider
+            model: Model to use
+            base_system_prompt: Base system prompt (will be modified for retries)
+
+        Returns:
+            (args, operations) or None if failed after all retries
+        """
+        # Initial call
+        response = await provider.chat(
+            messages=[
+                {"role": "system", "content": base_system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            tools=_SAVE_MEMORY_TOOL,
+            model=model,
+        )
+
+        logger.debug("LLM response: tool_calls={}, finish_reason={}, has_content={}",
+                   len(response.tool_calls), response.finish_reason, response.content is not None)
+
+        result = self._process_save_memory_tool_call(response)
+        if result is not None:
+            return result
+
+        # Retry logic
+        for retry_attempt in range(2):
+            logger.warning(
+                "Memory consolidation: no save_memory tool call, retrying (attempt {}/2)...",
+                retry_attempt + 1,
+            )
+            retry_prompt = self._add_retry_instruction(prompt, retry_attempt + 1)
+            retry_system_prompt = "You are a memory consolidation assistant. Use the save_memory tool."
+            response = await provider.chat(
+                messages=[
+                    {"role": "system", "content": retry_system_prompt},
+                    {"role": "user", "content": retry_prompt},
+                ],
+                tools=_SAVE_MEMORY_TOOL,
+                model=model,
+            )
+            result = self._process_save_memory_tool_call(response)
+            if result is not None:
+                logger.info("Memory consolidation succeeded on retry {}", retry_attempt + 1)
+                return result
+
+        logger.error("Memory consolidation failed after 3 attempts (1 initial + 2 retries)")
+        return None
+
     async def _consolidate_direct(
         self,
         session: Session,
@@ -811,7 +871,9 @@ class MemoryStore:
                 f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}"
             )
 
-        prompt = f"""Process this conversation and call the save_memory tool.
+        prompt = f"""IMPORTANT: You MUST call the save_memory tool with your consolidation.
+Do NOT just describe the changes in your response - actually call the tool.
+If there is nothing worth saving, call the tool with empty operations.
 
 {MEMORY_FILES_DESC}
 
@@ -824,23 +886,11 @@ class MemoryStore:
         try:
             logger.debug("Calling LLM for memory consolidation: model={}, messages={}, prompt_len={}",
                        model, len(old_messages), len(prompt))
-            response = await provider.chat(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                tools=_SAVE_MEMORY_TOOL,
-                model=model,
+
+            result = await self._call_save_memory_with_retry(
+                prompt, provider, model,
+                base_system_prompt="You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."
             )
-
-            logger.debug("LLM response: tool_calls={}, finish_reason={}, has_content={}",
-                       len(response.tool_calls), response.finish_reason, response.content is not None)
-
-            # 复用共享的 tool call 处理逻辑
-            result = self._process_save_memory_tool_call(response)
             if result is None:
                 return False
             args, operations = result
@@ -875,7 +925,7 @@ class MemoryStore:
 
         # 用完整消息搜索（不压缩，信息更全）
         try:
-            results = await self._rag_store.search_advanced(formatted)
+            results = await self._rag_store.search_advanced(formatted, top_k=top_k)
             memory_path = self.memory_dir.resolve()
 
             memory_results = []
@@ -884,7 +934,7 @@ class MemoryStore:
                 if doc_path == memory_path or memory_path in doc_path.parents:
                     memory_results.append(r.combined_content)
 
-            return memory_results[:top_k], formatted
+            return memory_results, formatted
         except Exception as e:
             logger.warning("Memory search failed: {}", e)
             return [], formatted
@@ -933,7 +983,8 @@ class MemoryStore:
                 for i, m in enumerate(related_memory)
             ]) if related_memory else "(No related memories)"
 
-            prompt = f"""Process this conversation and call the save_memory tool.
+            prompt = f"""IMPORTANT: You MUST call the save_memory tool.
+Do NOT just describe changes - actually call the tool.
 
 {MEMORY_FILES_DESC}
 
@@ -951,23 +1002,12 @@ You can use update_section for granular updates, and multiple operations if need
 
             logger.debug("Calling LLM for RAG memory consolidation: model={}, prompt_len={}",
                        model, len(prompt))
-            response = await provider.chat(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a memory consolidation assistant. Use the save_memory tool with the conversation and related memories.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                tools=_SAVE_MEMORY_TOOL,
-                model=model,
+
+            # Step 4: 处理 tool call with retry
+            result = await self._call_save_memory_with_retry(
+                prompt, provider, model,
+                base_system_prompt="You are a memory consolidation assistant. Use the save_memory tool with the conversation and related memories."
             )
-
-            logger.debug("LLM response: tool_calls={}, finish_reason={}, has_content={}",
-                       len(response.tool_calls), response.finish_reason, response.content is not None)
-
-            # Step 4: 处理 tool call
-            result = self._process_save_memory_tool_call(response)
             if result is None:
                 return False
             args, operations = result
@@ -980,6 +1020,21 @@ You can use update_section for granular updates, and multiple operations if need
         except Exception:
             logger.exception("Memory consolidation failed with exception")
             return False
+
+    def _add_retry_instruction(self, original_prompt: str, retry_count: int) -> str:
+        """Add retry instruction to prompt."""
+        if retry_count == 1:
+            retry_instruction = """
+IMPORTANT: You MUST call the save_memory tool with your consolidation.
+Do not just describe the changes in your response - actually call the tool.
+"""
+        else:  # retry_count == 2
+            retry_instruction = """
+CRITICAL: This is your second retry. You MUST call the save_memory tool.
+If you cannot identify any memory-worthy content, call the tool with empty operations.
+DO NOT respond without calling the tool.
+"""
+        return retry_instruction + "\n\n" + original_prompt
 
     def _format_messages(self, messages: list[dict]) -> str:
         """Format messages for LLM processing."""

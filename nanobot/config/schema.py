@@ -309,7 +309,20 @@ class MCPServerConfig(Base):
 # RAG default constants (extracted magic numbers for readability)
 class RAGDefaults:
     """Default values for RAG configuration."""
-    # Chunking
+    # Dual granularity
+    ENABLE_DUAL_GRANULARITY: bool = True
+
+    # Small granularity (for vector search)
+    SMALL_MIN_CHUNK_SIZE: int = 400
+    SMALL_MAX_CHUNK_SIZE: int = 700
+    SMALL_CHUNK_OVERLAP_RATIO: float = 0.15  # 15% overlap
+
+    # Large granularity (for BM25 and context)
+    LARGE_MIN_CHUNK_SIZE: int = 900
+    LARGE_MAX_CHUNK_SIZE: int = 1300
+    LARGE_CHUNK_OVERLAP_RATIO: float = 0.1  # 10% overlap
+
+    # Chunking (legacy single granularity)
     MIN_CHUNK_SIZE: int = 500
     MAX_CHUNK_SIZE: int = 800
     CHUNK_OVERLAP_RATIO: float = 0.12  # 12% overlap
@@ -322,7 +335,7 @@ class RAGDefaults:
     TOP_DOCUMENTS: int = 3
 
     # Thresholds
-    BM25_THRESHOLD: float = 0.05
+    BM25_THRESHOLD: float = 0.1  # Min-Max normalized: higher = better, 0.1 keeps top ~90%
     VECTOR_THRESHOLD: float = 0.3
     RERANK_THRESHOLD: float = 0.5
     DEDUP_THRESHOLD: float = 0.7
@@ -341,8 +354,8 @@ class RAGDefaults:
     TOP_K: int = 5
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
 
-    # Hybrid search
-    RRF_K: int = 60
+    # Hybrid search - RRF_K=15 balances ranking sensitivity with stability
+    RRF_K: int = 15
 
     # Cache
     CACHE_TTL_SECONDS: int = 300  # 5 minutes
@@ -353,7 +366,20 @@ class RAGConfig(Base):
 
     enabled: bool = True
 
-    # Chunking strategy (Phase 2b)
+    # Dual granularity indexing
+    enable_dual_granularity: bool = RAGDefaults.ENABLE_DUAL_GRANULARITY
+
+    # Small granularity (for vector search)
+    small_min_chunk_size: int = RAGDefaults.SMALL_MIN_CHUNK_SIZE
+    small_max_chunk_size: int = RAGDefaults.SMALL_MAX_CHUNK_SIZE
+    small_chunk_overlap_ratio: float = RAGDefaults.SMALL_CHUNK_OVERLAP_RATIO
+
+    # Large granularity (for BM25 and context)
+    large_min_chunk_size: int = RAGDefaults.LARGE_MIN_CHUNK_SIZE
+    large_max_chunk_size: int = RAGDefaults.LARGE_MAX_CHUNK_SIZE
+    large_chunk_overlap_ratio: float = RAGDefaults.LARGE_CHUNK_OVERLAP_RATIO
+
+    # Chunking strategy (Phase 2b) - legacy single granularity
     chunk_strategy: str = "phase2b"  # "fixed" | "paragraph" | "phase2b"
     min_chunk_size: int = RAGDefaults.MIN_CHUNK_SIZE
     max_chunk_size: int = RAGDefaults.MAX_CHUNK_SIZE
@@ -368,7 +394,7 @@ class RAGConfig(Base):
     enable_document_level: bool = True
     top_documents: int = RAGDefaults.TOP_DOCUMENTS
 
-    # Thresholds (BM25 scores are negative, normalized to 0-1, use lower values)
+    # Thresholds (BM25 scores are Min-Max normalized to [0, 1], higher = better)
     bm25_threshold: float = RAGDefaults.BM25_THRESHOLD
     vector_threshold: float = RAGDefaults.VECTOR_THRESHOLD
     rerank_threshold: float = RAGDefaults.RERANK_THRESHOLD

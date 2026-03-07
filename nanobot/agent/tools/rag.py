@@ -64,6 +64,7 @@ class SearchKnowledgeTool(Tool):
         self._docs_dir: Path | None = None
         self._memory_dir: Path | None = None
         self._rag_dir: Path | None = None
+        self._last_results: list[SearchResult] | list[SearchResultWithContext] | None = None
 
     def _ensure_initialized(self) -> None:
         """Initialize the document store if not already initialized."""
@@ -105,7 +106,8 @@ class SearchKnowledgeTool(Tool):
         # Index docs/ (convert legacy chunk_overlap to ratio)
         docs_stats = await self._doc_store.scan_and_index(
             self._docs_dir,
-            chunk_size=self.rag_config.max_chunk_size,
+            min_chunk_size=self.rag_config.min_chunk_size,
+            max_chunk_size=self.rag_config.max_chunk_size,
             chunk_overlap_ratio=self.rag_config.chunk_overlap_ratio,
             root_path=self._docs_dir,
         )
@@ -116,7 +118,8 @@ class SearchKnowledgeTool(Tool):
         if include_memory:
             memory_stats = await self._doc_store.scan_and_index(
                 self._memory_dir,
-                chunk_size=self.rag_config.memory_chunk_size,
+                min_chunk_size=self.rag_config.memory_chunk_size // 2,
+                max_chunk_size=self.rag_config.memory_chunk_size,
                 chunk_overlap_ratio=self.rag_config.memory_chunk_overlap_ratio,
                 root_path=self._memory_dir,
             )
@@ -134,7 +137,8 @@ class SearchKnowledgeTool(Tool):
         # 使用配置中的参数，而非硬编码
         return await self._doc_store.scan_and_index(
             self._memory_dir,
-            chunk_size=self.rag_config.memory_chunk_size,
+            min_chunk_size=self.rag_config.memory_chunk_size // 2,
+            max_chunk_size=self.rag_config.memory_chunk_size,
             chunk_overlap_ratio=self.rag_config.memory_chunk_overlap_ratio,
             root_path=self._memory_dir,
         )
@@ -146,14 +150,16 @@ class SearchKnowledgeTool(Tool):
 
         # Try advanced search first
         try:
-            advanced_results = await self._doc_store.search_advanced(query)
+            advanced_results = await self._doc_store.search_advanced(query, top_k=top_k)
             if advanced_results:
+                self._last_results = advanced_results
                 return self._format_advanced_results(query, advanced_results)
         except Exception as e:
             logger.warning("Advanced search failed, falling back to basic search: {}", e)
 
         # Fallback to basic search
         results = await self._doc_store.search(query, top_k=top_k)
+        self._last_results = results
 
         if not results:
             stats = self._doc_store.get_stats()
@@ -212,6 +218,10 @@ class SearchKnowledgeTool(Tool):
         self._ensure_initialized()
         assert self._doc_store is not None
         return self._doc_store.is_vector_enabled()
+
+    def get_last_results(self) -> list[SearchResult | SearchResultWithContext] | None:
+        """Get the raw results from the last search."""
+        return self._last_results
 
     @property
     def doc_store(self) -> "DocumentStore | None":

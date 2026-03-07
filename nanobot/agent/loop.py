@@ -30,7 +30,12 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, RAGConfig, ToolsConfig
+    from nanobot.config.schema import (
+        ChannelsConfig,
+        ExecToolConfig,
+        RAGConfig,
+        ToolsConfig,
+    )
     from nanobot.cron.service import CronService
 
 
@@ -52,10 +57,14 @@ class ConsolidationTrigger:
         "决定", "decision", "结论", "conclusion",
         "todo", "任务", "task", "计划", "plan",
         "项目", "project", "架构", "architecture",
-        "记住", "remember", "note", "笔记"
+        "记住", "remember", "note", "笔记",
+        # 新增：偏好表达关键词
+        "我喜欢", "我不喜欢", "我想要", "我不想要",
+        "我希望", "我不希望", "prefer", "I like", "I don't like",
+        "changed my mind", "my preference",
     ]
     DEFAULT_IMPORTANT_CHECK_WINDOW = 5  # 检查最近 5 条
-    DEFAULT_IMPORTANT_MIN_MESSAGES = 5  # 至少有 5 条才触发
+    DEFAULT_IMPORTANT_MIN_MESSAGES = 2  # 至少有 2 条才触发
 
     def __init__(
         self,
@@ -641,6 +650,8 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
+            if self._retrieve_tool:
+                self._retrieve_tool._last_results = None
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
@@ -744,6 +755,8 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        if self._retrieve_tool:
+            self._retrieve_tool._last_results = None
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )

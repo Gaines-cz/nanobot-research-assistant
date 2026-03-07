@@ -89,9 +89,14 @@ class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
         self._load_model()
         assert self._model is not None
 
+        # Truncate texts to avoid OOM (bge-m3 has ~8192 token limit)
+        # We truncate at ~4000 chars as a safe guard
+        max_text_chars = 4000
+        truncated_texts = [text[:max_text_chars] if len(text) > max_text_chars else text for text in texts]
+
         # Run in thread pool to avoid blocking event loop
         loop = asyncio.get_running_loop()
-        embeddings = await loop.run_in_executor(None, self._model.encode, texts)
+        embeddings = await loop.run_in_executor(None, self._model.encode, truncated_texts)
         return [e.tolist() for e in embeddings]
 
     @property

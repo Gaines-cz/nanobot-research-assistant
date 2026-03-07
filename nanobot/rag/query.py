@@ -1,5 +1,6 @@
 """Query preprocessing for RAG."""
 
+import re
 from typing import Set
 
 # Common research term abbreviations
@@ -42,6 +43,28 @@ QUERY_ABBREVIATIONS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _phrase_exists_in_query(phrase: str, query: str) -> bool:
+    """Check if a phrase exists as a complete part in the query."""
+    phrase_lower = phrase.lower()
+    query_lower = query.lower()
+
+    # Exact match
+    if phrase_lower == query_lower:
+        return True
+
+    # Check if the phrase contains any Chinese characters
+    has_chinese = any('\u4e00' <= char <= '\u9fff' for char in phrase)
+
+    if has_chinese:
+        # For Chinese, use substring matching
+        return phrase_lower in query_lower
+    else:
+        # For English (including hyphenated words like fine-tuning), use word boundaries
+        # Use lookahead/lookbehind to ensure we match complete phrase
+        pattern = r'(?<!\w)' + re.escape(phrase_lower) + r'(?!\w)'
+        return re.search(pattern, query_lower) is not None
+
+
 def expand_query(query: str) -> str:
     """
     Expand abbreviations in query, adding synonyms.
@@ -55,20 +78,32 @@ def expand_query(query: str) -> str:
     query_lower = query.lower()
     expansions: list[str] = [query]  # Keep original query
 
+    # Track phrases we've already added (to avoid duplicates from multiple abbreviations)
+    added_phrases: Set[str] = {query_lower}
+
     for abbr, expansions_list in QUERY_ABBREVIATIONS.items():
         # Check if abbreviation is in the query (as a whole word)
-        import re
         # Use word boundary matching for English abbreviations
         if abbr.isalpha():
             pattern = r'\b' + re.escape(abbr) + r'\b'
-            if re.search(pattern, query_lower):
-                expansions.extend(expansions_list)
+            if not re.search(pattern, query_lower):
+                continue
         else:
             # For Chinese characters, use simple substring matching
-            if abbr in query_lower:
-                expansions.extend(expansions_list)
+            if abbr not in query_lower:
+                continue
 
-    # Deduplicate while preserving order
+        # Add expansions, skipping those already present in original query or already added
+        for exp in expansions_list:
+            exp_lower = exp.lower()
+            if exp_lower in added_phrases:
+                continue
+            if _phrase_exists_in_query(exp, query):
+                continue
+            expansions.append(exp)
+            added_phrases.add(exp_lower)
+
+    # Deduplicate while preserving order (final safety check)
     seen: Set[str] = set()
     result: list[str] = []
     for exp in expansions:

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,6 @@ try:
         CreateMessageRequest,
         CreateMessageRequestBody,
         Emoji,
-        GetFileRequest,
         GetMessageResourceRequest,
         P2ImMessageReceiveV1,
     )
@@ -312,7 +312,7 @@ class FeishuChannel(BaseChannel):
                 except Exception as e:
                     logger.warning("Feishu WebSocket error: {}", e)
                 if self._running:
-                    import time; time.sleep(5)
+                    time.sleep(5)
 
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
         self._ws_thread.start()
@@ -379,12 +379,15 @@ class FeishuChannel(BaseChannel):
     @staticmethod
     def _parse_md_table(table_text: str) -> dict | None:
         """Parse a markdown table into a Feishu table element."""
-        lines = [l.strip() for l in table_text.strip().split("\n") if l.strip()]
+        lines = [line.strip() for line in table_text.strip().split("\n") if line.strip()]
         if len(lines) < 3:
             return None
-        split = lambda l: [c.strip() for c in l.strip("|").split("|")]
-        headers = split(lines[0])
-        rows = [split(l) for l in lines[2:]]
+
+        def _split_row(row: str) -> list[str]:
+            return [cell.strip() for cell in row.strip("|").split("|")]
+
+        headers = _split_row(lines[0])
+        rows = [_split_row(line) for line in lines[2:]]
         columns = [{"tag": "column", "name": f"c{i}", "display_name": h, "width": "auto"}
                    for i, h in enumerate(headers)]
         return {
