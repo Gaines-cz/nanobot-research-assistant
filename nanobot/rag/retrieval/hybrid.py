@@ -45,6 +45,16 @@ class HybridRetriever(Retriever):
         self._vector_retriever = VectorRetriever(db_connection, embedding_provider, config)
         self._bm25_retriever = BM25Retriever(db_connection, embedding_provider, config)
 
+    def clear_cache(self) -> None:
+        """Clear all search caches (including sub-component caches)."""
+        # Clear own cache
+        super().clear_cache()
+        # Clear sub-component caches
+        if self._vector_retriever:
+            self._vector_retriever.clear_cache()
+        if self._bm25_retriever:
+            self._bm25_retriever.clear_cache()
+
     async def search(self, query: str, top_k: int = 5) -> List[SearchResult]:
         """
         Perform hybrid search with staged fusion.
@@ -61,8 +71,12 @@ class HybridRetriever(Retriever):
         if self.config.enable_search_cache:
             cached_results = self._cache_manager.basic.get(cache_key)
             if cached_results is not None:
-                logger.debug("Basic search cache hit for query: {}", query)
+                logger.warning("[HYBRID CACHE] ⚠️ CACHE HIT for query: {}", query[:50])
                 return cached_results
+            else:
+                logger.info("[HYBRID CACHE] Cache miss for query: {} (cache enabled)", query[:50])
+        else:
+            logger.info("[HYBRID CACHE] Cache disabled for query: {} - will execute fresh search", query[:50])
 
         # Expand query
         expanded_query = self._query_expander.expand(query)

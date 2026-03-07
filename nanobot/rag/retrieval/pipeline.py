@@ -124,8 +124,12 @@ class AdvancedSearchPipeline(AdvancedRetriever):
         if self.config.enable_search_cache:
             cached_results = self._cache_manager.advanced.get(cache_key)
             if cached_results is not None:
-                logger.debug("Advanced search cache hit for query: {}", query)
+                logger.warning("[RAG CACHE] ⚠️ CACHE HIT for query: {}", query[:50])
                 return cached_results
+            else:
+                logger.info("[RAG CACHE] Cache miss for query: {} (cache enabled)", query[:50])
+        else:
+            logger.info("[RAG CACHE] Cache disabled for query: {} - will execute fresh search", query[:50])
 
         # Log search entry
         logger.info("[RAG] search_advanced called with query: {}", query)
@@ -204,13 +208,14 @@ class AdvancedSearchPipeline(AdvancedRetriever):
                 filtered_vector = [r for r in vector_results if r.score >= vector_threshold]
                 filtered_ft = [r for r in fulltext_results if r.score >= bm25_threshold]
 
-                # If too few results after filtering, relax thresholds
+                # If too few results after filtering, relax thresholds - keep more candidates for recall
+                MIN_RECALL_CANDIDATES = 10
                 if len(filtered_vector) < 3 and vector_results:
                     logger.info("[RAG] Too few vector results ({}), relaxing threshold", len(filtered_vector))
-                    filtered_vector = vector_results[:top_k]  # Keep top_k regardless of threshold
+                    filtered_vector = vector_results[:max(top_k, MIN_RECALL_CANDIDATES)]  # Keep more candidates for recall
                 if len(filtered_ft) < 3 and fulltext_results:
                     logger.info("[RAG] Too few fulltext results ({}), relaxing threshold", len(filtered_ft))
-                    filtered_ft = fulltext_results[:top_k]  # Keep top_k regardless of threshold
+                    filtered_ft = fulltext_results[:max(top_k, MIN_RECALL_CANDIDATES)]  # Keep more candidates for recall
 
                 logger.info("[RAG] After relaxed filtering: vector={}, fulltext={}",
                             len(filtered_vector), len(filtered_ft))
@@ -411,6 +416,18 @@ class AdvancedSearchPipeline(AdvancedRetriever):
         except Exception as e:
             logger.warning("Rerank failed, returning original results: {}", e)
             return results
+
+    def clear_cache(self) -> None:
+        """Clear all search caches (including sub-component caches)."""
+        # Clear own cache
+        super().clear_cache()
+        # Clear sub-component caches
+        if hasattr(self, '_hybrid_retriever') and self._hybrid_retriever:
+            self._hybrid_retriever.clear_cache()
+        if hasattr(self, '_vector_retriever') and self._vector_retriever:
+            self._vector_retriever.clear_cache()
+        if hasattr(self, '_bm25_retriever') and self._bm25_retriever:
+            self._bm25_retriever.clear_cache()
 
     def _get_cache_key(self, query: str, top_k: int | None = None) -> str:
         """

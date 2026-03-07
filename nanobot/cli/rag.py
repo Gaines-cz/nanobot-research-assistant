@@ -346,6 +346,13 @@ def rag_eval(
         console.print(f"Precomputing embeddings for {len(queries)} queries...")
         queries = await generator.precompute_embeddings(queries)
 
+        # Clear search cache AND disable caching BEFORE any search to ensure fresh evaluation
+        console.print("[bold]Clearing search cache and disabling cache for evaluation...[/bold]")
+        store.clear_cache()
+        original_cache_setting = rag_config.enable_search_cache
+        rag_config.enable_search_cache = False
+        console.print(f"  - Cache cleared. Original setting was: {original_cache_setting}, now set to: False")
+
         # Step 2: Run evaluation
         console.print("Running evaluation...")
         eval_config = EvalConfig(random_seed=random_seed)
@@ -354,6 +361,9 @@ def rag_eval(
             queries,
             include_baseline=include_baseline,
         )
+
+        # Restore original cache setting
+        rag_config.enable_search_cache = original_cache_setting
 
         # If verbose, collect baseline results for comparison
         if verbose and include_baseline:
