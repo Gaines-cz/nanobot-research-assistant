@@ -87,6 +87,20 @@ class BaseRetriever(ABC):
         # ANY FTS5 query syntax interpretation (keywords, operators, etc.)
         return f'"{sanitized}"'
 
+    @staticmethod
+    def _sanitize_fts_query_or(query: str) -> str:
+        """Sanitize query for FTS5 OR keyword search.
+
+        Returns: "token1" OR "token2" OR "token3"
+        """
+        sanitized = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff]', ' ', query)
+        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+        if not sanitized:
+            return ""
+        tokens = sanitized.split()
+        quoted_tokens = [f'"{token}"' for token in tokens]
+        return " OR ".join(quoted_tokens)
+
     def clear_cache(self) -> None:
         """Clear search cache."""
         self._cache_manager.clear_all()
