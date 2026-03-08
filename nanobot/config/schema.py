@@ -336,7 +336,7 @@ class RAGDefaults:
 
     # Thresholds
     BM25_THRESHOLD: float = 0.1  # Min-Max normalized: higher = better, 0.1 keeps top ~90%
-    VECTOR_THRESHOLD: float = 0.3
+    VECTOR_THRESHOLD: float = 0.72
     RERANK_THRESHOLD: float = 0.5
     DEDUP_THRESHOLD: float = 0.7
 

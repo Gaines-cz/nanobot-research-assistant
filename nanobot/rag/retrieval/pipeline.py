@@ -205,14 +205,22 @@ class AdvancedSearchPipeline(AdvancedRetriever):
                     logger.info("[RAG] Full-text search: 0 results")
 
                 # Use soft filtering: apply thresholds but keep a minimum number of results
+                # Step 1: Apply primary vector threshold (0.72)
                 filtered_vector = [r for r in vector_results if r.score >= vector_threshold]
                 filtered_ft = [r for r in fulltext_results if r.score >= bm25_threshold]
 
-                # If too few results after filtering, relax thresholds - keep more candidates for recall
+                # Step 2: If too few vector results, relax to 0.6 threshold
                 MIN_RECALL_CANDIDATES = 10
                 if len(filtered_vector) < 3 and vector_results:
-                    logger.info("[RAG] Too few vector results ({}), relaxing threshold", len(filtered_vector))
-                    filtered_vector = vector_results[:max(top_k, MIN_RECALL_CANDIDATES)]  # Keep more candidates for recall
+                    relax_threshold = 0.6
+                    logger.info("[RAG] Too few vector results ({}), relaxing threshold to {}", len(filtered_vector), relax_threshold)
+                    filtered_vector = [r for r in vector_results if r.score >= relax_threshold]
+
+                    # Step 3: If still too few, take top candidates directly
+                    if len(filtered_vector) < 3:
+                        logger.info("[RAG] Still too few vector results ({}), taking top candidates", len(filtered_vector))
+                        filtered_vector = vector_results[:max(top_k, MIN_RECALL_CANDIDATES)]
+
                 if len(filtered_ft) < 3 and fulltext_results:
                     logger.info("[RAG] Too few fulltext results ({}), relaxing threshold", len(filtered_ft))
                     filtered_ft = fulltext_results[:max(top_k, MIN_RECALL_CANDIDATES)]  # Keep more candidates for recall
