@@ -204,26 +204,28 @@ class IndexingPipeline:
             ))
             chunk_map[i] = cursor.lastrowid
 
-        # Then insert small chunks with parent references
-        for i, small_chunk in enumerate(hierarchical_chunks.small_chunks):
-            large_idx = hierarchical_chunks.small_to_large.get(i)
-            parent_chunk_id = chunk_map.get(large_idx) if large_idx is not None else None
-
-            cursor = db.execute("""
+        # Then insert small chunks with parent references (batch insert for performance)
+        if hierarchical_chunks.small_chunks:
+            small_chunk_data = []
+            for i, small_chunk in enumerate(hierarchical_chunks.small_chunks):
+                large_idx = hierarchical_chunks.small_to_large.get(i)
+                parent_chunk_id = chunk_map.get(large_idx) if large_idx is not None else None
+                small_chunk_data.append((
+                    doc_id,
+                    i,
+                    small_chunk.content,
+                    small_chunk.start_pos,
+                    small_chunk.end_pos,
+                    small_chunk.chunk_type,
+                    small_chunk.section_title,
+                    "small",
+                    parent_chunk_id,
+                ))
+            cursor.executemany("""
                 INSERT INTO chunks
                 (doc_id, chunk_index, content, start_pos, end_pos, chunk_type, section_title, granularity, parent_chunk_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                doc_id,
-                i,
-                small_chunk.content,
-                small_chunk.start_pos,
-                small_chunk.end_pos,
-                small_chunk.chunk_type,
-                small_chunk.section_title,
-                "small",
-                parent_chunk_id,
-            ))
+            """, small_chunk_data)
 
         # Generate embeddings if enabled
         # In dual granularity mode: only generate embeddings for small chunks (used for vector retrieval)
