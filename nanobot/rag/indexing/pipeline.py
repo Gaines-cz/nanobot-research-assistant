@@ -226,12 +226,10 @@ class IndexingPipeline:
             ))
 
         # Generate embeddings if enabled
-        # In dual granularity mode: generate embeddings for both small and large chunks
-        # - small chunks: used for vector retrieval
-        # - large chunks: used for evaluation and similarity calculation
+        # In dual granularity mode: only generate embeddings for small chunks (used for vector retrieval)
+        # Large chunks don't need embeddings - semantic deduplication can be skipped if needed
         if self.config.enable_dual_granularity:
             await self._generate_embeddings(doc_id, hierarchical_chunks.small_chunks, granularity_label="small")
-            await self._generate_embeddings(doc_id, hierarchical_chunks.large_chunks, granularity_label="large")
         else:
             # In single granularity mode, generate embeddings for large chunks
             await self._generate_embeddings(doc_id, hierarchical_chunks.large_chunks)

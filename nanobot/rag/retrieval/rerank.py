@@ -142,14 +142,14 @@ class SemanticDeduplicator:
     async def deduplicate(
         self,
         chunks: list[str],
-        embeddings: list[list[float]],
+        embeddings: list[Optional[list[float]]],
     ) -> list[int]:
         """
         Deduplicate chunks using semantic similarity.
 
         Args:
             chunks: List of chunk texts
-            embeddings: List of embeddings corresponding to chunks
+            embeddings: List of embeddings corresponding to chunks (can be None)
 
         Returns:
             List of indices to keep (chunks with similarity < threshold)
@@ -160,13 +160,19 @@ class SemanticDeduplicator:
         if not chunks:
             return []
 
+        # Check if all embeddings are available
+        if any(emb is None for emb in embeddings):
+            # If any embedding is missing, return all indices (skip deduplication)
+            return list(range(len(chunks)))
+
         keep_indices: list[int] = []
 
         for i in range(len(chunks)):
             # Check if this chunk is too similar to any already kept chunk
             too_similar = False
             for j in keep_indices:
-                sim = self._cosine_similarity(embeddings[i], embeddings[j])
+                # We already verified embeddings are not None above
+                sim = self._cosine_similarity(embeddings[i], embeddings[j])  # type: ignore
                 if sim >= self.similarity_threshold:
                     too_similar = True
                     break
@@ -208,7 +214,7 @@ class RerankService:
     async def rerank_and_dedup(
         self,
         query: str,
-        candidates: list[tuple[str, Any, list[float]]],
+        candidates: list[tuple[str, Any, Optional[list[float]]]],
     ) -> list[tuple[int, Any, float]]:
         """
         Apply reranking and deduplication.
@@ -268,20 +274,28 @@ class RerankService:
                 for idx, score in reranked_indices[:3]
             ]
 
-        # Step 3: Semantic deduplication
+        # Step 3: Semantic deduplication (only if all embeddings are available)
+        # Skip semantic deduplication if any embedding is missing (e.g., large chunks in dual mode)
         if len(thresholded) > 1:
             # Get embeddings for thresholded candidates
             dedup_indices = [t[0] for t in thresholded]
             dedup_embeddings = [candidate_embeddings[i] for i in dedup_indices]
             dedup_texts = [candidate_texts[i] for i in dedup_indices]
 
-            # Deduplicate
-            keep_in_thresholded = await self.deduplicator.deduplicate(
-                dedup_texts, dedup_embeddings
-            )
+            # Check if all embeddings are available
+            all_embeddings_available = all(emb is not None for emb in dedup_embeddings)
 
-            # Keep only deduplicated entries
-            thresholded = [thresholded[i] for i in keep_in_thresholded]
+            if all_embeddings_available:
+                # Deduplicate
+                keep_in_thresholded = await self.deduplicator.deduplicate(
+                    dedup_texts, dedup_embeddings
+                )
+
+                # Keep only deduplicated entries
+                thresholded = [thresholded[i] for i in keep_in_thresholded]
+            else:
+                # Skip semantic deduplication when embeddings are missing
+                logger.debug("Skipping semantic deduplication: some embeddings are missing")
 
         # Sort by final score
         thresholded.sort(key=lambda x: x[2], reverse=True)
