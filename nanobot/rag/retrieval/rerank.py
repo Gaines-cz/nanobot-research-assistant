@@ -79,7 +79,7 @@ class CrossEncoderReranker(Reranker):
                 def _load_model():
                     model = CrossEncoder(
                         self.model_name,
-                        max_length=512,
+                        max_length= 2048,
                         model_kwargs={
                             "torch_dtype": torch.float16,
                         }
