@@ -665,7 +665,7 @@ class HierarchicalChunker(Chunker):
             sub_text = large_chunk.content
 
             # Split into small chunks within this large chunk
-            sub_chunks = SemanticChunker.chunk_with_section_awareness(
+            sub_chunks = SemanticChunker.chunk_by_paragraph_sentence(
                 sub_text, self.small_min, self.small_max, self.small_overlap
             )
 
