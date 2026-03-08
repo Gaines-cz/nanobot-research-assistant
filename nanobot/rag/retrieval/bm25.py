@@ -39,6 +39,7 @@ class BM25Retriever(Retriever):
         1. First try exact phrase match for high precision
         2. Then try OR keyword match for high recall
         3. Merge results, phrase matches first, deduplicated
+        4. Add neighbor chunks (prev/next) for better recall
         """
         # Generate both query types
         phrase_query = self._sanitize_fts_query(query)
@@ -49,7 +50,8 @@ class BM25Retriever(Retriever):
             return self._get_fallback_results(top_k)
 
         # Execute both queries (request more results for merging)
-        fetch_k = top_k * 2
+        MIN_FETCH_K = 20
+        fetch_k = max(top_k * 2, MIN_FETCH_K)
         phrase_results = self._query_with_safe_query(phrase_query, fetch_k) if phrase_query else []
         or_results = self._query_with_safe_query(or_query, fetch_k) if or_query else []
 
@@ -72,8 +74,76 @@ class BM25Retriever(Retriever):
                 seen.add(key)
                 merged.append(r)
 
+        # Add neighbor chunks (prev/next) for better recall
+        if merged:
+            neighbor_chunks = self._fetch_neighbor_chunks(merged)
+            for r in neighbor_chunks:
+                key = f"{r.path}:{r.chunk_index}"
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(r)
+
         # Truncate to top_k
         return merged[:top_k]
+
+    def _fetch_neighbor_chunks(self, base_results: List[SearchResult]) -> List[SearchResult]:
+        """Fetch neighboring chunks (prev and next) for each result.
+
+        Returns a list of neighbor chunks with lower scores.
+        """
+        if not base_results:
+            return []
+
+        db = self._db.db
+        neighbors: List[SearchResult] = []
+
+        for result in base_results:
+            # Fetch prev chunk (index - 1) and next chunk (index + 1)
+            for offset in (-1, 1):
+                try:
+                    if self.config.enable_dual_granularity:
+                        cursor = db.execute("""
+                            SELECT
+                                d.path,
+                                d.filename,
+                                c.chunk_index,
+                                c.content
+                            FROM chunks c
+                            JOIN documents d ON c.doc_id = d.id
+                            WHERE d.path = ?
+                              AND c.chunk_index = ?
+                              AND (c.granularity = 'large' OR c.granularity IS NULL)
+                        """, (result.path, result.chunk_index + offset))
+                    else:
+                        cursor = db.execute("""
+                            SELECT
+                                d.path,
+                                d.filename,
+                                c.chunk_index,
+                                c.content
+                            FROM chunks c
+                            JOIN documents d ON c.doc_id = d.id
+                            WHERE d.path = ?
+                              AND c.chunk_index = ?
+                        """, (result.path, result.chunk_index + offset))
+
+                    row = cursor.fetchone()
+                    if row:
+                        # Give neighbor a lower score than original result
+                        neighbor_score = result.score * 0.8
+                        neighbors.append(SearchResult(
+                            path=row[0],
+                            filename=row[1],
+                            chunk_index=row[2],
+                            content=row[3],
+                            score=neighbor_score,
+                            source="fulltext_neighbor",
+                        ))
+                except Exception as e:
+                    logger.debug("[RAG] Failed to fetch neighbor chunk: {}", e)
+                    continue
+
+        return neighbors
 
     def _query_with_safe_query(self, safe_query: str, top_k: int) -> List[SearchResult]:
         """Execute FTS query with the given safe query string."""
