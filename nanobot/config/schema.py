@@ -344,6 +344,9 @@ class RAGDefaults:
     RERANK_MODEL: str = "BAAI/bge-reranker-v2-m3"
     RERANK_TOP_K: int = 20
 
+    # Rerank deduplication embedding (for semantic dedup)
+    ENABLE_RERANK_DEDUP_EMBEDDING: bool = False  # Disable embed_batch for rerank semantic dedup (saves ~4s)
+
     # Memory index (smaller chunks for memory files which are shorter and more conversational)
     MEMORY_CHUNK_SIZE: int = 500
     MEMORY_CHUNK_OVERLAP_RATIO: float = 0.1  # 10% overlap for memory files
@@ -356,6 +359,11 @@ class RAGDefaults:
 
     # Hybrid search - RRF_K=15 balances ranking sensitivity with stability
     RRF_K: int = 15
+
+    # Recall stage1 top_k parameters
+    RECALL_VECTOR_TOP_K: int = 20
+    RECALL_BM25_TOP_K: int = 20
+    RECALL_STAGE1_TOP_K: int = 6
 
     # Cache
     CACHE_TTL_SECONDS: int = 300  # 5 minutes
@@ -404,6 +412,7 @@ class RAGConfig(Base):
     rerank_model: str = RAGDefaults.RERANK_MODEL  # Multi-language reranker
     enable_rerank: bool = True
     rerank_top_k: int = RAGDefaults.RERANK_TOP_K  # Only rerank top-20 for performance
+    enable_rerank_dedup_embedding: bool = RAGDefaults.ENABLE_RERANK_DEDUP_EMBEDDING
 
     # Query expansion
     enable_query_expand: bool = True
@@ -425,6 +434,11 @@ class RAGConfig(Base):
 
     # Hybrid search weights (RRF parameter)
     rrf_k: int = RAGDefaults.RRF_K  # RRF parameter k
+
+    # Recall stage1 top_k parameters
+    recall_vector_top_k: int = RAGDefaults.RECALL_VECTOR_TOP_K
+    recall_bm25_top_k: int = RAGDefaults.RECALL_BM25_TOP_K
+    recall_stage1_top_k: int = RAGDefaults.RECALL_STAGE1_TOP_K
 
     # Search cache
     enable_search_cache: bool = True

@@ -3,6 +3,7 @@
 This module provides staged fusion of BM25 and vector search results.
 """
 
+import time
 from typing import List, Optional
 
 from loguru import logger
@@ -66,6 +67,8 @@ class HybridRetriever(Retriever):
         Returns:
             List of SearchResult sorted by relevance
         """
+        hybrid_start = time.perf_counter()
+
         # Check cache first
         cache_key = self._get_cache_key(query, top_k)
         if self.config.enable_search_cache:
@@ -79,15 +82,22 @@ class HybridRetriever(Retriever):
             logger.info("[HYBRID CACHE] Cache disabled for query: {} - will execute fresh search", query[:50])
 
         # Expand query
+        expand_start = time.perf_counter()
         expanded_query = self._query_expander.expand(query)
+        expand_elapsed = (time.perf_counter() - expand_start) * 1000
         results: List[SearchResult] = []
 
         if self._db.vector_enabled:
             try:
                 # BM25 search: top 50 results (more for base)
+                bm25_start = time.perf_counter()
                 bm25_results = self._bm25_retriever._fulltext_search(expanded_query, 50)
+                bm25_elapsed = (time.perf_counter() - bm25_start) * 1000
+
                 # Vector search: top 50 results (for supplement)
+                vector_start = time.perf_counter()
                 vector_results = await self._vector_retriever.search(expanded_query, 50)
+                vector_elapsed = (time.perf_counter() - vector_start) * 1000
 
                 if not vector_results:
                     for result in bm25_results:
@@ -96,8 +106,11 @@ class HybridRetriever(Retriever):
                 else:
                     logger.info("[StagedFusion] Starting - BM25_results={}, vector_results={}",
                                 len(bm25_results), len(vector_results))
+                    logger.info("[RAG PERF] Hybrid components - BM25={:.1f}ms, Vector={:.1f}ms, QueryExpand={:.1f}ms",
+                               bm25_elapsed, vector_elapsed, expand_elapsed)
 
                     # Stage 1: Take BM25 top 50 as base
+                    fusion_start = time.perf_counter()
                     seen = set()
                     merged = []
                     for r in bm25_results:
@@ -116,23 +129,32 @@ class HybridRetriever(Retriever):
 
                     # Take top_k
                     results = merged[:top_k]
+                    fusion_elapsed = (time.perf_counter() - fusion_start) * 1000
 
                     final_sources = [r.source for r in results]
                     final_scores = [f"{r.score:.4f}" for r in results]
-                    logger.info("[StagedFusion] Complete - final_results={}, sources={}, scores={}",
-                                len(results), final_sources, final_scores)
+                    logger.info("[StagedFusion] Complete - final_results={}, sources={}, scores={}, fusion={:.1f}ms",
+                                len(results), final_sources, final_scores, fusion_elapsed)
             except Exception as e:
                 logger.warning("Hybrid search failed, falling back to full-text search only: {}", e)
                 self._db.record_vector_disabled()
 
         if not results:
+            fallback_start = time.perf_counter()
             fulltext_results = self._bm25_retriever._fulltext_search(expanded_query, top_k)
+            fallback_elapsed = (time.perf_counter() - fallback_start) * 1000
             for result in fulltext_results:
                 result.source = "fulltext"
             results = fulltext_results
+            logger.info("[RAG PERF] Hybrid fallback: {} results, elapsed={:.1f}ms",
+                       len(results), fallback_elapsed)
 
         # Store in cache
         if self.config.enable_search_cache:
             self._cache_manager.basic.set(cache_key, results)
+
+        hybrid_elapsed = (time.perf_counter() - hybrid_start) * 1000
+        logger.info("[RAG PERF] Hybrid search total: {} results, elapsed={:.1f}ms",
+                    len(results), hybrid_elapsed)
 
         return results

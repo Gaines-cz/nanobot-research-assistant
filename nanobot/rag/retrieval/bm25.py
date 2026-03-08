@@ -3,6 +3,7 @@
 This module provides BM25-based full-text search using SQLite FTS5.
 """
 
+import time
 from typing import List
 
 from loguru import logger
@@ -41,6 +42,8 @@ class BM25Retriever(Retriever):
         3. Merge results, phrase matches first, deduplicated
         4. Add neighbor chunks (prev/next) for better recall
         """
+        search_start = time.perf_counter()
+
         # Generate both query types
         phrase_query = self._sanitize_fts_query(query)
         or_query = self._sanitize_fts_query_or(query)
@@ -50,15 +53,25 @@ class BM25Retriever(Retriever):
             return self._get_fallback_results(top_k)
 
         # Execute both queries (request more results for merging)
-        MIN_FETCH_K = 20
-        fetch_k = max(top_k * 2, MIN_FETCH_K)
+        min_fetch_k = 20
+        fetch_k = max(top_k * 2, min_fetch_k)
+
+        phrase_start = time.perf_counter()
         phrase_results = self._query_with_safe_query(phrase_query, fetch_k) if phrase_query else []
+        phrase_elapsed = (time.perf_counter() - phrase_start) * 1000
+
+        or_start = time.perf_counter()
         or_results = self._query_with_safe_query(or_query, fetch_k) if or_query else []
+        or_elapsed = (time.perf_counter() - or_start) * 1000
 
         # Log the results for debugging
-        logger.debug(f"[RAG] Phrase search: {len(phrase_results)} results, OR search: {len(or_results)} results")
+        logger.debug("[RAG] Phrase search: {} results, OR search: {} results",
+                     len(phrase_results), len(or_results))
+        logger.debug("[RAG PERF] BM25 phrase={:.1f}ms, OR={:.1f}ms",
+                     phrase_elapsed, or_elapsed)
 
         # Merge results: phrase first, then OR, deduplicated
+        merge_start = time.perf_counter()
         seen = set()
         merged: List[SearchResult] = []
 
@@ -76,15 +89,28 @@ class BM25Retriever(Retriever):
 
         # Add neighbor chunks (prev/next) for better recall
         if merged:
+            neighbor_start = time.perf_counter()
             neighbor_chunks = self._fetch_neighbor_chunks(merged)
+            neighbor_elapsed = (time.perf_counter() - neighbor_start) * 1000
+            logger.debug("[RAG PERF] BM25 neighbor fetch: {} chunks, elapsed={:.1f}ms",
+                         len(neighbor_chunks), neighbor_elapsed)
             for r in neighbor_chunks:
                 key = f"{r.path}:{r.chunk_index}"
                 if key not in seen:
                     seen.add(key)
                     merged.append(r)
 
+        merge_elapsed = (time.perf_counter() - merge_start) * 1000
+        logger.debug("[RAG PERF] BM25 merge+neighbor: elapsed={:.1f}ms", merge_elapsed)
+
         # Truncate to top_k
-        return merged[:top_k]
+        final_results = merged[:top_k]
+
+        total_elapsed = (time.perf_counter() - search_start) * 1000
+        logger.info("[RAG PERF] BM25 full-text: {} results, elapsed={:.1f}ms",
+                    len(final_results), total_elapsed)
+
+        return final_results
 
     def _fetch_neighbor_chunks(self, base_results: List[SearchResult]) -> List[SearchResult]:
         """Fetch neighboring chunks (prev and next) for each result.

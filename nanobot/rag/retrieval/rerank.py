@@ -5,10 +5,14 @@ moved from the original rerank.py file.
 """
 
 import asyncio
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
+import torch
 from loguru import logger
+
+from nanobot.utils.torch import get_optimal_device
 
 
 class Reranker(ABC):
@@ -41,6 +45,7 @@ class CrossEncoderReranker(Reranker):
     - Lightweight model (~80MB)
     - Fast inference on M4
     - Only reranks top-20 candidates for performance
+    - Uses FP16 precision for faster inference and lower memory usage
     """
 
     def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
@@ -60,15 +65,32 @@ class CrossEncoderReranker(Reranker):
 
             try:
                 from sentence_transformers import CrossEncoder
-                logger.info("Loading CrossEncoder model: {}", self.model_name)
+
+                # 获取最优设备
+                device = get_optimal_device()
+                if device == "mps":
+                    logger.info("MPS GPU acceleration enabled")
+
+                logger.info("Loading CrossEncoder model: {} with FP16 on {}", self.model_name, device)
+
                 # Run in thread pool to avoid blocking async loop
                 loop = asyncio.get_event_loop()
-                self._model = await loop.run_in_executor(
-                    None,
-                    lambda: CrossEncoder(self.model_name, max_length=512)
-                )
+
+                def _load_model():
+                    model = CrossEncoder(
+                        self.model_name,
+                        max_length=512,
+                        model_kwargs={
+                            "torch_dtype": torch.float16,
+                        }
+                    )
+                    # 手动移动模型到指定设备
+                    model.model.to(device)
+                    return model
+
+                self._model = await loop.run_in_executor(None, _load_model)
                 self._loaded = True
-                logger.info("CrossEncoder model loaded successfully")
+                logger.info("CrossEncoder model loaded successfully (FP16, {})", device.upper())
             except ImportError:
                 logger.warning("sentence-transformers not available, rerank disabled")
                 self._model = None
@@ -106,10 +128,15 @@ class CrossEncoderReranker(Reranker):
 
             # Run inference in thread pool
             loop = asyncio.get_event_loop()
+
+            rerank_start = time.perf_counter()
             scores = await loop.run_in_executor(
                 None,
                 lambda: self._model.predict(pairs)
             )
+            rerank_elapsed = (time.perf_counter() - rerank_start) * 1000
+            logger.info("[RAG PERF] CrossEncoder rerank: {} candidates, elapsed={:.1f}ms",
+                        len(candidates), rerank_elapsed)
 
             # Create (index, score) tuples
             indexed_scores = [(i, float(score)) for i, score in enumerate(scores)]
@@ -165,6 +192,7 @@ class SemanticDeduplicator:
             # If any embedding is missing, return all indices (skip deduplication)
             return list(range(len(chunks)))
 
+        dedup_start = time.perf_counter()
         keep_indices: list[int] = []
 
         for i in range(len(chunks)):
@@ -179,6 +207,10 @@ class SemanticDeduplicator:
 
             if not too_similar:
                 keep_indices.append(i)
+
+        dedup_elapsed = (time.perf_counter() - dedup_start) * 1000
+        logger.info("[RAG PERF] Semantic dedup: {} -> {} chunks, elapsed={:.1f}ms",
+                    len(chunks), len(keep_indices), dedup_elapsed)
 
         return keep_indices
 

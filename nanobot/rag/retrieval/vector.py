@@ -3,6 +3,7 @@
 This module provides vector-based similarity search using sqlite-vec.
 """
 
+import time
 from typing import List
 
 from loguru import logger
@@ -35,9 +36,15 @@ class VectorRetriever(Retriever):
 
         db = self._db.db
         results: List[SearchResult] = []
+        search_start = time.perf_counter()
 
         try:
+            # Generate query embedding
+            embed_start = time.perf_counter()
             query_embedding = await self._embedding_provider.embed(query)
+            embed_elapsed = (time.perf_counter() - embed_start) * 1000
+            logger.debug("[RAG PERF] Vector embed: elapsed={:.1f}ms, dim={}", embed_elapsed, len(query_embedding))
+
             import sqlite_vec
             embedding_blob = sqlite_vec.serialize_float32(query_embedding)
 
@@ -110,5 +117,9 @@ class VectorRetriever(Retriever):
             logger.warning("[DualGranularity] Vector search failed: {}", e)
             self._db.record_vector_disabled()
             return []
+
+        search_elapsed = (time.perf_counter() - search_start) * 1000
+        logger.debug("[RAG PERF] Vector search total: {} results, elapsed={:.1f}ms",
+                     len(results), search_elapsed)
 
         return results

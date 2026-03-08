@@ -8,6 +8,7 @@ This module provides the multi-step advanced search pipeline:
 """
 
 import hashlib
+import time
 from typing import Any, List, Optional, Tuple
 
 from loguru import logger
@@ -137,28 +138,55 @@ class AdvancedSearchPipeline(AdvancedRetriever):
                     self.config.bm25_threshold, self.config.vector_threshold,
                     self.config.top_k, self.config.rrf_k)
 
+        # Track overall search performance
+        overall_start = time.perf_counter()
+
         # Expand query
         expanded_query = self._query_expander.expand(query)
         if expanded_query != query:
             logger.info("[RAG] Expanded query: {}", expanded_query)
 
         # Step 1-3: Core recall -> Context expansion -> Document-level -> Merge
+        step1_start = time.perf_counter()
         core_results = await self._step1_core_chunk_recall(expanded_query, internal_top_k)
+        step1_elapsed = (time.perf_counter() - step1_start) * 1000
+        logger.info("[RAG PERF] Step1 core chunk recall: {} results, elapsed={:.1f}ms",
+                    len(core_results), step1_elapsed)
+
         if not core_results:
             logger.info("[RAG] No core results found")
+            overall_elapsed = (time.perf_counter() - overall_start) * 1000
+            logger.info("[RAG PERF] search_advanced total: elapsed={:.1f}ms (no results)", overall_elapsed)
             if self.config.enable_search_cache:
                 self._cache_manager.advanced.set(cache_key, [])
             return []
 
         logger.info("[RAG] Got {} core results", len(core_results))
 
+        step2_start = time.perf_counter()
         expanded_chunks = self._step2_context_expansion(core_results)
+        step2_elapsed = (time.perf_counter() - step2_start) * 1000
+        logger.info("[RAG PERF] Step2 context expansion: {} chunks, elapsed={:.1f}ms",
+                    len(expanded_chunks), step2_elapsed)
+
+        step3_start = time.perf_counter()
         top_docs = self._step3_document_level(core_results)
+        step3_elapsed = (time.perf_counter() - step3_start) * 1000
+        logger.info("[RAG PERF] Step3 document level: {} docs, elapsed={:.1f}ms",
+                    len(top_docs), step3_elapsed)
+
+        merge_start = time.perf_counter()
         merged_results = self._merge_context_and_document_results(expanded_chunks, top_docs)
+        merge_elapsed = (time.perf_counter() - merge_start) * 1000
+        logger.info("[RAG PERF] Merge results: {} merged, elapsed={:.1f}ms",
+                    len(merged_results), merge_elapsed)
 
         # Step 4: Apply rerank and dedup
         if self.config.enable_rerank and self._rerank_service:
+            rerank_start = time.perf_counter()
             final_results = await self._apply_rerank(expanded_query, merged_results)
+            rerank_elapsed = (time.perf_counter() - rerank_start) * 1000
+            logger.info("[RAG PERF] Step4 rerank+dedup: elapsed={:.1f}ms", rerank_elapsed)
         else:
             final_results = merged_results
 
@@ -167,6 +195,11 @@ class AdvancedSearchPipeline(AdvancedRetriever):
             final_results = final_results[:top_k]
 
         logger.info("[RAG] Final results count: {}", len(final_results))
+
+        # Log overall performance
+        overall_elapsed = (time.perf_counter() - overall_start) * 1000
+        logger.info("[RAG PERF] search_advanced total: elapsed={:.1f}ms, results={}",
+                    overall_elapsed, len(final_results))
 
         # Store in cache
         if self.config.enable_search_cache:
@@ -184,25 +217,30 @@ class AdvancedSearchPipeline(AdvancedRetriever):
 
         if self._db.vector_enabled:
             try:
-                # Vector search: top 50 results (for supplement)
-                vector_results = await self._vector_retriever.search(query, 50)
-                # BM25 search: top 50 results (more for base)
-                fulltext_results = self._bm25_retriever._fulltext_search(query, 50)
+                # Vector search: top recall_vector_top_k results (for supplement)
+                vector_start = time.perf_counter()
+                vector_results = await self._vector_retriever.search(query, self.config.recall_vector_top_k)
+                vector_elapsed = (time.perf_counter() - vector_start) * 1000
+
+                # BM25 search: top recall_bm25_top_k results (more for base)
+                bm25_start = time.perf_counter()
+                fulltext_results = self._bm25_retriever._fulltext_search(query, self.config.recall_bm25_top_k)
+                bm25_elapsed = (time.perf_counter() - bm25_start) * 1000
 
                 # Log raw search results
                 if vector_results:
                     v_scores = [r.score for r in vector_results]
-                    logger.info("[RAG] Vector search: {} results, scores min={:.4f}, max={:.4f}, avg={:.4f}",
-                                len(vector_results), min(v_scores), max(v_scores), sum(v_scores)/len(v_scores))
+                    logger.info("[RAG] Vector search: {} results, scores min={:.4f}, max={:.4f}, avg={:.4f}, elapsed={:.1f}ms",
+                                len(vector_results), min(v_scores), max(v_scores), sum(v_scores)/len(v_scores), vector_elapsed)
                 else:
-                    logger.info("[RAG] Vector search: 0 results")
+                    logger.info("[RAG] Vector search: 0 results, elapsed={:.1f}ms", vector_elapsed)
 
                 if fulltext_results:
                     ft_scores = [r.score for r in fulltext_results]
-                    logger.info("[RAG] Full-text search: {} results, scores min={:.4f}, max={:.4f}, avg={:.4f}",
-                                len(fulltext_results), min(ft_scores), max(ft_scores), sum(ft_scores)/len(ft_scores))
+                    logger.info("[RAG] Full-text search: {} results, scores min={:.4f}, max={:.4f}, avg={:.4f}, elapsed={:.1f}ms",
+                                len(fulltext_results), min(ft_scores), max(ft_scores), sum(ft_scores)/len(ft_scores), bm25_elapsed)
                 else:
-                    logger.info("[RAG] Full-text search: 0 results")
+                    logger.info("[RAG] Full-text search: 0 results, elapsed={:.1f}ms", bm25_elapsed)
 
                 # Use soft filtering: apply thresholds but keep a minimum number of results
                 # Step 1: Apply primary vector threshold (0.72)
@@ -210,7 +248,7 @@ class AdvancedSearchPipeline(AdvancedRetriever):
                 filtered_ft = [r for r in fulltext_results if r.score >= bm25_threshold]
 
                 # Step 2: If too few vector results, relax to 0.6 threshold
-                MIN_RECALL_CANDIDATES = 10
+                min_recall_candidates = 10
                 if len(filtered_vector) < 3 and vector_results:
                     relax_threshold = 0.6
                     logger.info("[RAG] Too few vector results ({}), relaxing threshold to {}", len(filtered_vector), relax_threshold)
@@ -219,11 +257,11 @@ class AdvancedSearchPipeline(AdvancedRetriever):
                     # Step 3: If still too few, take top candidates directly
                     if len(filtered_vector) < 3:
                         logger.info("[RAG] Still too few vector results ({}), taking top candidates", len(filtered_vector))
-                        filtered_vector = vector_results[:max(top_k, MIN_RECALL_CANDIDATES)]
+                        filtered_vector = vector_results[:max(top_k, min_recall_candidates)]
 
                 if len(filtered_ft) < 3 and fulltext_results:
                     logger.info("[RAG] Too few fulltext results ({}), relaxing threshold", len(filtered_ft))
-                    filtered_ft = fulltext_results[:max(top_k, MIN_RECALL_CANDIDATES)]  # Keep more candidates for recall
+                    filtered_ft = fulltext_results[:max(top_k, min_recall_candidates)]  # Keep more candidates for recall
 
                 logger.info("[RAG] After relaxed filtering: vector={}, fulltext={}",
                             len(filtered_vector), len(filtered_ft))
@@ -240,29 +278,33 @@ class AdvancedSearchPipeline(AdvancedRetriever):
                     merged.append(r)
 
                 # Stage 2: Add vector results not in BM25
+                fusion_start = time.perf_counter()
                 for r in filtered_vector:
                     key = f"{r.path}:{r.chunk_index}"
                     if key not in seen:
                         seen.add(key)
                         merged.append(r)
 
-                # Take top_k
-                final_results = merged[:top_k]
+                # Take recall_stage1_top_k
+                final_results = merged[:self.config.recall_stage1_top_k]
+                fusion_elapsed = (time.perf_counter() - fusion_start) * 1000
                 final_sources = [r.source for r in final_results]
                 final_scores = [f"{r.score:.4f}" for r in final_results]
-                logger.info("[RAG] Step1 StagedFusion complete - final_results={}, sources={}, scores={}",
-                            len(final_results), final_sources, final_scores)
+                logger.info("[RAG PERF] Step1 fusion: {} results, sources={}, scores={}, elapsed={:.1f}ms",
+                            len(final_results), final_sources, final_scores, fusion_elapsed)
 
                 return final_results
             except Exception as e:
                 logger.warning("Hybrid search failed, falling back: {}", e)
 
         # Fallback: full-text only
+        fallback_start = time.perf_counter()
         logger.info("[RAG] Vector disabled or hybrid failed, using full-text fallback")
         fulltext_results = self._bm25_retriever._fulltext_search(query, top_k)
+        fallback_elapsed = (time.perf_counter() - fallback_start) * 1000
         # Don't apply threshold filtering for fallback
         final_results = fulltext_results[:top_k]
-        logger.info("[RAG] Fallback: {} results", len(final_results))
+        logger.info("[RAG PERF] Fallback: {} results, elapsed={:.1f}ms", len(final_results), fallback_elapsed)
         return final_results
 
     def _step2_context_expansion(self, core_results: List[SearchResult]) -> List[ChunkInfo]:
@@ -274,6 +316,8 @@ class AdvancedSearchPipeline(AdvancedRetriever):
 
     def _step3_document_level(self, core_results: List[SearchResult]) -> List[Tuple[DocumentInfo, float]]:
         """Step 3: Document-level retrieval."""
+        step3_start = time.perf_counter()
+
         if not self.config.enable_document_level:
             return []
 
@@ -309,7 +353,13 @@ class AdvancedSearchPipeline(AdvancedRetriever):
             doc_avg_scores.append((doc_info_map[doc_id], avg_score))
 
         doc_avg_scores.sort(key=lambda x: x[1], reverse=True)
-        return doc_avg_scores[:self.config.top_documents]
+        result = doc_avg_scores[:self.config.top_documents]
+
+        step3_elapsed = (time.perf_counter() - step3_start) * 1000
+        logger.info("[RAG PERF] Step3 document level: {} docs, elapsed={:.1f}ms",
+                    len(result), step3_elapsed)
+
+        return result
 
     def _merge_context_and_document_results(
         self,
@@ -317,6 +367,8 @@ class AdvancedSearchPipeline(AdvancedRetriever):
         top_docs: List[Tuple[DocumentInfo, float]]
     ) -> List[SearchResultWithContext]:
         """Merge context-expanded chunks with document-level results."""
+        merge_start = time.perf_counter()
+
         db = self._db.db
         results = []
 
@@ -375,6 +427,10 @@ class AdvancedSearchPipeline(AdvancedRetriever):
         for i, r in enumerate(results):
             r.rank = i + 1
 
+        merge_elapsed = (time.perf_counter() - merge_start) * 1000
+        logger.info("[RAG PERF] Merge results: {} merged, elapsed={:.1f}ms",
+                    len(results), merge_elapsed)
+
         return results
 
     async def _apply_rerank(
@@ -383,6 +439,8 @@ class AdvancedSearchPipeline(AdvancedRetriever):
         results: List[SearchResultWithContext],
     ) -> List[SearchResultWithContext]:
         """Apply Cross-Encoder reranking."""
+        rerank_start = time.perf_counter()
+
         if not self._rerank_service or not results:
             return results
 
@@ -398,16 +456,23 @@ class AdvancedSearchPipeline(AdvancedRetriever):
                 ))
                 result_map[i] = result
 
-            if self._db.vector_enabled:
+            # Get embeddings for semantic deduplication (only if enabled)
+            if self._db.vector_enabled and self.config.enable_rerank_dedup_embedding:
                 try:
+                    embed_batch_start = time.perf_counter()
                     texts = [c[0] for c in candidates]
                     embeddings = await self._embedding_provider.embed_batch(texts)
+                    embed_batch_elapsed = (time.perf_counter() - embed_batch_start) * 1000
+                    logger.info("[RAG PERF] Rerank embed_batch: {} texts, elapsed={:.1f}ms",
+                               len(texts), embed_batch_elapsed)
                     candidates = [
                         (c[0], c[1], emb)
                         for c, emb in zip(candidates, embeddings)
                     ]
                 except Exception as e:
                     logger.warning("Could not get embeddings for rerank/dedup: {}", e)
+            else:
+                logger.info("[RAG] Skipping embed_batch for rerank dedup (enable_rerank_dedup_embedding=False)")
 
             reranked = await self._rerank_service.rerank_and_dedup(query, candidates)
 
@@ -418,6 +483,10 @@ class AdvancedSearchPipeline(AdvancedRetriever):
 
             for i, r in enumerate(final_results):
                 r.rank = i + 1
+
+            rerank_total_elapsed = (time.perf_counter() - rerank_start) * 1000
+            logger.info("[RAG PERF] _apply_rerank total: {} -> {} results, elapsed={:.1f}ms",
+                       len(results), len(final_results), rerank_total_elapsed)
 
             return final_results
 

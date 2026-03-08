@@ -4,7 +4,10 @@ from abc import ABC, abstractmethod
 from threading import Lock
 from typing import Any
 
+import torch
 from loguru import logger
+
+from nanobot.utils.torch import get_optimal_device
 
 
 class EmbeddingProvider(ABC):
@@ -64,13 +67,19 @@ class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
                 logger.info("Loading sentence-transformers model: {}", self.model_name)
                 try:
                     from sentence_transformers import SentenceTransformer
+
+                    # 获取最优设备
+                    device = get_optimal_device()
+                    if device == "mps":
+                        logger.info("MPS GPU acceleration enabled for embeddings")
+
+                    self._model = SentenceTransformer(self.model_name, device=device)
+                    SentenceTransformerEmbeddingProvider._model_cache[self.model_name] = self._model
                 except ImportError:
                     raise ImportError(
                         "sentence-transformers is required. "
                         "Install with: pip install 'nanobot-ai[rag]'"
                     )
-                self._model = SentenceTransformer(self.model_name)
-                SentenceTransformerEmbeddingProvider._model_cache[self.model_name] = self._model
 
             # Get embedding dimensions by doing a test embedding
             test_embedding = self._model.encode("test")

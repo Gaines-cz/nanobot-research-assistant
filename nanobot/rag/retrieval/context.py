@@ -4,7 +4,10 @@ This module provides functionality to expand search results with
 surrounding context chunks.
 """
 
+import time
 from typing import List, Optional
+
+from loguru import logger
 
 from nanobot.config.schema import RAGConfig
 from nanobot.rag.models import ChunkInfo, SearchResult
@@ -49,6 +52,8 @@ class ContextExpander:
         Returns:
             List of ChunkInfo objects with expanded context
         """
+        expand_start = time.perf_counter()
+
         if not enable_context_expansion:
             chunks = []
             db = self._db.db
@@ -166,6 +171,10 @@ class ContextExpander:
                 next_content=next_content,
                 embedding=embedding,
             ))
+
+        expand_elapsed = (time.perf_counter() - expand_start) * 1000
+        logger.info("[RAG PERF] Context expansion: {} chunks, elapsed={:.1f}ms",
+                    len(expanded_chunks), expand_elapsed)
 
         return expanded_chunks
 
