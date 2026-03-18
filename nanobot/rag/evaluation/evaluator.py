@@ -2,11 +2,13 @@
 
 import re
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from loguru import logger
 
+from nanobot.config.schema import RAGConfig
 from nanobot.rag.embeddings import EmbeddingProvider
+from nanobot.rag.evaluation.ablation import AblationConfig, ABLATION_CONFIGS
 from nanobot.rag.evaluation.base import (
     EvalConfig,
     EvalQuery,
@@ -189,3 +191,138 @@ class RAGEvaluator:
             baseline_hit=baseline_hit,
             baseline_hit_rank=baseline_hit_rank,
         )
+
+
+class AblationStudy:
+    """
+    Ablation study executor for RAG pipeline.
+
+    Systematically tests the contribution of each component by
+    disabling them one by one and measuring the impact on performance.
+    """
+
+    def __init__(
+        self,
+        doc_store: DocumentStore,
+        embedding_provider: Optional[EmbeddingProvider] = None,
+        eval_config: Optional[EvalConfig] = None,
+        rag_config: Optional[RAGConfig] = None,
+    ):
+        """
+        Initialize ablation study.
+
+        Args:
+            doc_store: Document store for retrieval
+            embedding_provider: Embedding provider
+            eval_config: Evaluation configuration
+            rag_config: RAG configuration (will be modified during study)
+        """
+        self.doc_store = doc_store
+        self.embedding_provider = embedding_provider
+        self.eval_config = eval_config or EvalConfig()
+        self.rag_config = rag_config
+
+    async def run_ablation(
+        self,
+        queries: List[EvalQuery],
+        ablation_configs: Optional[List[AblationConfig]] = None,
+        include_baseline: bool = False,
+    ) -> Dict[str, EvalSummary]:
+        """
+        Run ablation study with specified configurations.
+
+        Args:
+            queries: List of evaluation queries
+            ablation_configs: List of ablation configurations (uses predefined if None)
+            include_baseline: Whether to include BM25 baseline in each run
+
+        Returns:
+            Dictionary mapping config names to EvalSummary
+        """
+        from loguru import logger
+
+        if ablation_configs is None:
+            ablation_configs = ABLATION_CONFIGS
+
+        results = {}
+
+        # Backup original RAG config
+        original_config = self._backup_rag_config()
+
+        try:
+            for i, ablation_cfg in enumerate(ablation_configs):
+                logger.info(
+                    "Running ablation {}/{}: {}",
+                    i + 1, len(ablation_configs), ablation_cfg.name
+                )
+
+                # Apply ablation configuration
+                self._apply_ablation_config(ablation_cfg)
+
+                # Clear cache to ensure fresh runs
+                self.doc_store.clear_cache()
+
+                # Run evaluation
+                evaluator = RAGEvaluator(
+                    self.doc_store,
+                    self.embedding_provider,
+                    self.eval_config
+                )
+                summary = await evaluator.evaluate(
+                    queries,
+                    include_baseline=include_baseline
+                )
+                results[ablation_cfg.name] = summary
+
+                logger.info(
+                    "  {} completed: Recall@5={:.4f}, MRR={:.4f}, Latency={:.2f}ms",
+                    ablation_cfg.name,
+                    summary.recall_at_5,
+                    summary.mrr,
+                    summary.avg_latency_ms
+                )
+
+        finally:
+            # Restore original configuration
+            self._restore_rag_config(original_config)
+
+        return results
+
+    def _backup_rag_config(self) -> Optional[Dict]:
+        """Backup current RAG configuration."""
+        if self.rag_config is None:
+            return None
+
+        return {
+            "enable_bm25": self.rag_config.enable_bm25,
+            "enable_vector": self.rag_config.enable_vector,
+            "enable_context_expansion": self.rag_config.enable_context_expansion,
+            "enable_document_level": self.rag_config.enable_document_level,
+            "enable_rerank": self.rag_config.enable_rerank,
+            "enable_query_expand": self.rag_config.enable_query_expand,
+            "enable_search_cache": self.rag_config.enable_search_cache,
+        }
+
+    def _restore_rag_config(self, backup: Optional[Dict]) -> None:
+        """Restore RAG configuration from backup."""
+        if backup is None or self.rag_config is None:
+            return
+
+        self.rag_config.enable_bm25 = backup["enable_bm25"]
+        self.rag_config.enable_vector = backup["enable_vector"]
+        self.rag_config.enable_context_expansion = backup["enable_context_expansion"]
+        self.rag_config.enable_document_level = backup["enable_document_level"]
+        self.rag_config.enable_rerank = backup["enable_rerank"]
+        self.rag_config.enable_query_expand = backup["enable_query_expand"]
+        self.rag_config.enable_search_cache = backup["enable_search_cache"]
+
+    def _apply_ablation_config(self, ablation_cfg: AblationConfig) -> None:
+        """Apply an ablation configuration to the RAG config."""
+        if self.rag_config is None:
+            return
+
+        # Apply config settings
+        ablation_cfg.apply_to_rag_config(self.rag_config)
+
+        # Disable cache for ablation studies to ensure consistent results
+        self.rag_config.enable_search_cache = False

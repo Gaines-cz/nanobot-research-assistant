@@ -414,6 +414,10 @@ class RAGConfig(Base):
     rerank_top_k: int = RAGDefaults.RERANK_TOP_K  # Only rerank top-20 for performance
     enable_rerank_dedup_embedding: bool = RAGDefaults.ENABLE_RERANK_DEDUP_EMBEDDING
 
+    # Core retrieval components (for ablation studies)
+    enable_bm25: bool = True
+    enable_vector: bool = True
+
     # Query expansion
     enable_query_expand: bool = True
 

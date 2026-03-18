@@ -108,7 +108,14 @@ nanobot provider login openai-codex
 
 ## Configuration
 
-Config file location: `~/.nanobot/config.json`
+**Config file location:** `~/.nanobot/config.json`
+
+**Important:** When determining configuration parameter values, always check the user's config file first. Do NOT assume code default values are the actual values in use.
+
+To read the config:
+```bash
+cat ~/.nanobot/config.json
+```
 
 Minimal config:
 ```json

@@ -283,8 +283,18 @@ def rag_eval(
     random_seed: int = typer.Option(42, "--seed", help="Random seed for reproducibility"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Save results to JSON file"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed results"),
+    ablation: bool = typer.Option(False, "--ablation", "-a", help="Run ablation study to test component contributions"),
+    analyze: bool = typer.Option(False, "--analyze", help="Enable deep failure case analysis"),
 ):
-    """Evaluate RAG retrieval performance."""
+    """
+    Evaluate RAG retrieval performance.
+
+    Provides comprehensive evaluation including:
+    - Core metrics (Recall@5, MRR, Hit Rate@5)
+    - Difficulty and failure breakdowns
+    - Optional ablation study (--ablation) to measure component contributions
+    - Optional deep failure analysis (--analyze)
+    """
     from nanobot.config.loader import load_config
     from nanobot.rag import (
         DocumentStore,
@@ -294,6 +304,9 @@ def rag_eval(
         DataGenerator,
         EvalConfig,
         RAGEvaluator,
+        AblationStudy,
+        ABLATION_CONFIGS,
+        ReportGenerator,
     )
 
     config = load_config()
@@ -323,9 +336,10 @@ def rag_eval(
     # Store queries and baseline results for verbose output
     eval_queries = []
     baseline_results_cache = {}
+    ablation_results = None
 
     async def run_evaluation():
-        nonlocal eval_queries, baseline_results_cache
+        nonlocal eval_queries, baseline_results_cache, ablation_results
 
         # Step 1: Generate test data
         console.print(f"Generating {num_samples} test queries...")
@@ -340,7 +354,7 @@ def rag_eval(
 
         if not queries:
             console.print("[yellow]No suitable chunks found for evaluation[/yellow]")
-            return None
+            return None, None
 
         # Precompute embeddings
         console.print(f"Precomputing embeddings for {len(queries)} queries...")
@@ -353,8 +367,26 @@ def rag_eval(
         rag_config.enable_search_cache = False
         console.print(f"  - Cache cleared. Original setting was: {original_cache_setting}, now set to: False")
 
-        # Step 2: Run evaluation
-        console.print("Running evaluation...")
+        # Step 2: Run ablation study if requested
+        if ablation:
+            console.print("\n[bold]Running Ablation Study[/bold]")
+            console.print(f"Testing {len(ABLATION_CONFIGS)} configurations...")
+            ablation_study = AblationStudy(
+                store,
+                embedding_provider,
+                eval_config=EvalConfig(random_seed=random_seed),
+                rag_config=rag_config,
+            )
+            ablation_results = await ablation_study.run_ablation(
+                queries,
+                ablation_configs=ABLATION_CONFIGS,
+                include_baseline=False,
+            )
+        else:
+            ablation_results = None
+
+        # Step 3: Run main evaluation (on full pipeline)
+        console.print("\nRunning main evaluation...")
         eval_config = EvalConfig(random_seed=random_seed)
         evaluator = RAGEvaluator(store, embedding_provider, eval_config)
         summary = await evaluator.evaluate(
@@ -373,73 +405,27 @@ def rag_eval(
             for query in queries:
                 baseline_results_cache[query.id] = await baseline.search_bm25(query.query, top_k=5)
 
-        return summary
+        return summary, ablation_results
 
     with console.status("Running evaluation...", spinner="dots"):
-        summary = asyncio.run(run_evaluation())
+        summary, ablation_results = asyncio.run(run_evaluation())
 
     if summary is None:
         store.close()
         raise typer.Exit(1)
 
-    # Print results
-    console.print("\n[bold]Evaluation Results[/bold]\n")
+    # Use ReportGenerator for beautiful output
+    report_gen = ReportGenerator()
 
-    # Core metrics table
-    table = Table(title="Core Metrics")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Our Score", justify="right")
-    if include_baseline and summary.baseline_recall_at_5 is not None:
-        table.add_column("Baseline", justify="right")
-        table.add_column("Improvement", justify="right")
-
-    # Recall@5
-    if include_baseline and summary.baseline_recall_at_5 is not None:
-        improvement = ""
-        if summary.baseline_recall_at_5 > 0:
-            imp_pct = (summary.recall_at_5 - summary.baseline_recall_at_5) / summary.baseline_recall_at_5 * 100
-            improvement = f"{imp_pct:+.1f}%"
-        table.add_row(
-            "Recall@5",
-            f"{summary.recall_at_5:.4f}",
-            f"{summary.baseline_recall_at_5:.4f}",
-            improvement,
-        )
-    else:
-        table.add_row("Recall@5", f"{summary.recall_at_5:.4f}")
-
-    # MRR
-    if include_baseline and summary.baseline_mrr is not None:
-        improvement = ""
-        if summary.baseline_mrr > 0:
-            imp_pct = (summary.mrr - summary.baseline_mrr) / summary.baseline_mrr * 100
-            improvement = f"{imp_pct:+.1f}%"
-        table.add_row(
-            "MRR",
-            f"{summary.mrr:.4f}",
-            f"{summary.baseline_mrr:.4f}",
-            improvement,
-        )
-    else:
-        table.add_row("MRR", f"{summary.mrr:.4f}")
-
-    # Hit Rate@5
-    table.add_row("Hit Rate@5", f"{summary.hit_rate_at_5:.4f}")
-    table.add_row("Avg Latency", f"{summary.avg_latency_ms:.2f}ms")
-
-    console.print(table)
-
-    # Difficulty breakdown
-    if summary.difficulty_breakdown:
-        console.print("\n[bold]Difficulty Breakdown[/bold]")
-        for diff, data in summary.difficulty_breakdown.items():
-            console.print(f"  {diff}: {data['hits']}/{data['total']} (recall: {data['recall']:.2%})")
-
-    # Failure breakdown
-    if summary.failure_breakdown:
-        console.print("\n[bold]Failure Breakdown[/bold]")
-        for reason, count in summary.failure_breakdown.items():
-            console.print(f"  {reason}: {count}")
+    # Print full report
+    full_report = report_gen.generate_full_report(
+        summary,
+        eval_queries,
+        ablation_results=ablation_results if ablation else None,
+        ablation_configs=ABLATION_CONFIGS if ablation else None,
+        show_failure_analysis=analyze,
+    )
+    console.print(full_report)
 
     # Verbose: detailed results
     if verbose and summary.details:
@@ -491,6 +477,18 @@ def rag_eval(
             "difficulty_breakdown": summary.difficulty_breakdown,
             "failure_breakdown": summary.failure_breakdown,
         }
+
+        # Add ablation results if available
+        if ablation and ablation_results:
+            ablation_data = {}
+            for name, abl_summary in ablation_results.items():
+                ablation_data[name] = {
+                    "recall_at_5": abl_summary.recall_at_5,
+                    "mrr": abl_summary.mrr,
+                    "hit_rate_at_5": abl_summary.hit_rate_at_5,
+                    "avg_latency_ms": abl_summary.avg_latency_ms,
+                }
+            output_data["ablation_study"] = ablation_data
 
         # Add detailed per-query data if verbose
         if verbose and summary.details:

@@ -34,6 +34,11 @@ class EvalResult:
     # Baseline comparison
     baseline_hit: Optional[bool] = None
     baseline_hit_rank: Optional[int] = None
+    # Added for deep analysis
+    retrieved_contents: Optional[List[str]] = None  # Retrieved content snippets
+    expected_content: Optional[str] = None          # Expected golden content
+    query_embedding: Optional[List[float]] = None   # Query embedding vector
+    retrieved_embeddings: Optional[List[List[float]]] = None  # Embeddings of retrieved results
 
 
 @dataclass

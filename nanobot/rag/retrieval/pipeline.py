@@ -208,104 +208,136 @@ class AdvancedSearchPipeline(AdvancedRetriever):
         return final_results
 
     async def _step1_core_chunk_recall(self, query: str, top_k: int = 5) -> List[SearchResult]:
-        """Step 1: Core chunk recall using BM25 + vector search."""
+        """Step 1: Core chunk recall using BM25 + vector search.
+
+        Respects enable_bm25 and enable_vector config options for ablation studies.
+        """
         bm25_threshold = self.config.bm25_threshold
         vector_threshold = self.config.vector_threshold
 
         logger.info("[RAG] _step1_core_chunk_recall starting for query: {}", query)
+        logger.info("[RAG] Config - enable_bm25: {}, enable_vector: {}",
+                    self.config.enable_bm25, self.config.enable_vector)
         logger.info("[RAG] Thresholds - vector: {}, bm25: {}", vector_threshold, bm25_threshold)
 
-        if self._db.vector_enabled:
-            try:
-                # Vector search: top recall_vector_top_k results (for supplement)
-                vector_start = time.perf_counter()
-                vector_results = await self._vector_retriever.search(query, self.config.recall_vector_top_k)
-                vector_elapsed = (time.perf_counter() - vector_start) * 1000
+        # Get vector results (if enabled)
+        vector_results = []
+        vector_elapsed = 0.0
+        if self._db.vector_enabled and self.config.enable_vector:
+            vector_start = time.perf_counter()
+            vector_results = await self._vector_retriever.search(query, self.config.recall_vector_top_k)
+            vector_elapsed = (time.perf_counter() - vector_start) * 1000
+            if vector_results:
+                v_scores = [r.score for r in vector_results]
+                logger.info("[RAG] Vector search: {} results, scores min={:.4f}, max={:.4f}, avg={:.4f}, elapsed={:.1f}ms",
+                            len(vector_results), min(v_scores), max(v_scores), sum(v_scores)/len(v_scores), vector_elapsed)
+            else:
+                logger.info("[RAG] Vector search: 0 results, elapsed={:.1f}ms", vector_elapsed)
+        elif not self.config.enable_vector:
+            logger.info("[RAG] Vector search disabled by config")
 
-                # BM25 search: top recall_bm25_top_k results (more for base)
-                bm25_start = time.perf_counter()
-                fulltext_results = self._bm25_retriever._fulltext_search(query, self.config.recall_bm25_top_k)
-                bm25_elapsed = (time.perf_counter() - bm25_start) * 1000
+        # Get BM25 results (if enabled)
+        fulltext_results = []
+        bm25_elapsed = 0.0
+        if self.config.enable_bm25:
+            bm25_start = time.perf_counter()
+            fulltext_results = self._bm25_retriever._fulltext_search(query, self.config.recall_bm25_top_k)
+            bm25_elapsed = (time.perf_counter() - bm25_start) * 1000
+            if fulltext_results:
+                ft_scores = [r.score for r in fulltext_results]
+                logger.info("[RAG] Full-text search: {} results, scores min={:.4f}, max={:.4f}, avg={:.4f}, elapsed={:.1f}ms",
+                            len(fulltext_results), min(ft_scores), max(ft_scores), sum(ft_scores)/len(ft_scores), bm25_elapsed)
+            else:
+                logger.info("[RAG] Full-text search: 0 results, elapsed={:.1f}ms", bm25_elapsed)
+        else:
+            logger.info("[RAG] BM25 search disabled by config")
 
-                # Log raw search results
-                if vector_results:
-                    v_scores = [r.score for r in vector_results]
-                    logger.info("[RAG] Vector search: {} results, scores min={:.4f}, max={:.4f}, avg={:.4f}, elapsed={:.1f}ms",
-                                len(vector_results), min(v_scores), max(v_scores), sum(v_scores)/len(v_scores), vector_elapsed)
-                else:
-                    logger.info("[RAG] Vector search: 0 results, elapsed={:.1f}ms", vector_elapsed)
+        # If both are disabled, return empty
+        if not self.config.enable_bm25 and not self.config.enable_vector:
+            logger.warning("[RAG] Both BM25 and Vector search are disabled!")
+            return []
 
-                if fulltext_results:
-                    ft_scores = [r.score for r in fulltext_results]
-                    logger.info("[RAG] Full-text search: {} results, scores min={:.4f}, max={:.4f}, avg={:.4f}, elapsed={:.1f}ms",
-                                len(fulltext_results), min(ft_scores), max(ft_scores), sum(ft_scores)/len(ft_scores), bm25_elapsed)
-                else:
-                    logger.info("[RAG] Full-text search: 0 results, elapsed={:.1f}ms", bm25_elapsed)
+        # If only one is enabled, use it directly
+        if not self.config.enable_bm25:
+            logger.info("[RAG] Using only vector search results")
+            filtered_vector = [r for r in vector_results if r.score >= vector_threshold] if vector_results else []
+            if len(filtered_vector) < 3 and vector_results:
+                filtered_vector = vector_results[:max(top_k, 10)]
+            return filtered_vector[:self.config.recall_stage1_top_k]
 
-                # Use soft filtering: apply thresholds but keep a minimum number of results
-                # Step 1: Apply primary vector threshold (0.72)
-                filtered_vector = [r for r in vector_results if r.score >= vector_threshold]
-                filtered_ft = [r for r in fulltext_results if r.score >= bm25_threshold]
+        if not self.config.enable_vector or not self._db.vector_enabled:
+            logger.info("[RAG] Using only BM25 search results")
+            filtered_ft = [r for r in fulltext_results if r.score >= bm25_threshold] if fulltext_results else []
+            if len(filtered_ft) < 3 and fulltext_results:
+                filtered_ft = fulltext_results[:max(top_k, 10)]
+            return filtered_ft[:self.config.recall_stage1_top_k]
 
-                # Step 2: If too few vector results, relax to 0.6 threshold
-                min_recall_candidates = 10
-                if len(filtered_vector) < 3 and vector_results:
-                    relax_threshold = 0.6
-                    logger.info("[RAG] Too few vector results ({}), relaxing threshold to {}", len(filtered_vector), relax_threshold)
-                    filtered_vector = [r for r in vector_results if r.score >= relax_threshold]
+        # Continue with hybrid search (both enabled)
+        try:
+            # Use soft filtering: apply thresholds but keep a minimum number of results
+            # Step 1: Apply primary vector threshold (0.72)
+            filtered_vector = [r for r in vector_results if r.score >= vector_threshold]
+            filtered_ft = [r for r in fulltext_results if r.score >= bm25_threshold]
 
-                    # Step 3: If still too few, take top candidates directly
-                    if len(filtered_vector) < 3:
-                        logger.info("[RAG] Still too few vector results ({}), taking top candidates", len(filtered_vector))
-                        filtered_vector = vector_results[:max(top_k, min_recall_candidates)]
+            # Step 2: If too few vector results, relax to 0.6 threshold
+            min_recall_candidates = 10
+            if len(filtered_vector) < 3 and vector_results:
+                relax_threshold = 0.6
+                logger.info("[RAG] Too few vector results ({}), relaxing threshold to {}", len(filtered_vector), relax_threshold)
+                filtered_vector = [r for r in vector_results if r.score >= relax_threshold]
 
-                if len(filtered_ft) < 3 and fulltext_results:
-                    logger.info("[RAG] Too few fulltext results ({}), relaxing threshold", len(filtered_ft))
-                    filtered_ft = fulltext_results[:max(top_k, min_recall_candidates)]  # Keep more candidates for recall
+                # Step 3: If still too few, take top candidates directly
+                if len(filtered_vector) < 3:
+                    logger.info("[RAG] Still too few vector results ({}), taking top candidates", len(filtered_vector))
+                    filtered_vector = vector_results[:max(top_k, min_recall_candidates)]
 
-                logger.info("[RAG] After relaxed filtering: vector={}, fulltext={}",
-                            len(filtered_vector), len(filtered_ft))
+            if len(filtered_ft) < 3 and fulltext_results:
+                logger.info("[RAG] Too few fulltext results ({}), relaxing threshold", len(filtered_ft))
+                filtered_ft = fulltext_results[:max(top_k, min_recall_candidates)]  # Keep more candidates for recall
 
-                logger.info("[RAG] Step1 StagedFusion starting - filtered_ft={}, filtered_vector={}",
-                            len(filtered_ft), len(filtered_vector))
+            logger.info("[RAG] After relaxed filtering: vector={}, fulltext={}",
+                        len(filtered_vector), len(filtered_ft))
 
-                # Stage 1: BM25 first (all of filtered_ft)
-                seen = set()
-                merged = []
-                for r in filtered_ft:
-                    key = f"{r.path}:{r.chunk_index}"
+            logger.info("[RAG] Step1 StagedFusion starting - filtered_ft={}, filtered_vector={}",
+                        len(filtered_ft), len(filtered_vector))
+
+            # Stage 1: BM25 first (all of filtered_ft)
+            seen = set()
+            merged = []
+            for r in filtered_ft:
+                key = f"{r.path}:{r.chunk_index}"
+                seen.add(key)
+                merged.append(r)
+
+            # Stage 2: Add vector results not in BM25
+            fusion_start = time.perf_counter()
+            for r in filtered_vector:
+                key = f"{r.path}:{r.chunk_index}"
+                if key not in seen:
                     seen.add(key)
                     merged.append(r)
 
-                # Stage 2: Add vector results not in BM25
-                fusion_start = time.perf_counter()
-                for r in filtered_vector:
-                    key = f"{r.path}:{r.chunk_index}"
-                    if key not in seen:
-                        seen.add(key)
-                        merged.append(r)
+            # Take recall_stage1_top_k
+            final_results = merged[:self.config.recall_stage1_top_k]
+            fusion_elapsed = (time.perf_counter() - fusion_start) * 1000
+            final_sources = [r.source for r in final_results]
+            final_scores = [f"{r.score:.4f}" for r in final_results]
+            logger.info("[RAG PERF] Step1 fusion: {} results, sources={}, scores={}, elapsed={:.1f}ms",
+                        len(final_results), final_sources, final_scores, fusion_elapsed)
 
-                # Take recall_stage1_top_k
-                final_results = merged[:self.config.recall_stage1_top_k]
-                fusion_elapsed = (time.perf_counter() - fusion_start) * 1000
-                final_sources = [r.source for r in final_results]
-                final_scores = [f"{r.score:.4f}" for r in final_results]
-                logger.info("[RAG PERF] Step1 fusion: {} results, sources={}, scores={}, elapsed={:.1f}ms",
-                            len(final_results), final_sources, final_scores, fusion_elapsed)
-
+            return final_results
+        except Exception as e:
+            logger.warning("Hybrid search failed, falling back: {}", e)
+            # Fallback to BM25 only if enabled
+            if self.config.enable_bm25:
+                fallback_start = time.perf_counter()
+                logger.info("[RAG] Hybrid failed, using BM25 fallback")
+                fulltext_results = self._bm25_retriever._fulltext_search(query, top_k)
+                fallback_elapsed = (time.perf_counter() - fallback_start) * 1000
+                final_results = fulltext_results[:top_k]
+                logger.info("[RAG PERF] Fallback: {} results, elapsed={:.1f}ms", len(final_results), fallback_elapsed)
                 return final_results
-            except Exception as e:
-                logger.warning("Hybrid search failed, falling back: {}", e)
-
-        # Fallback: full-text only
-        fallback_start = time.perf_counter()
-        logger.info("[RAG] Vector disabled or hybrid failed, using full-text fallback")
-        fulltext_results = self._bm25_retriever._fulltext_search(query, top_k)
-        fallback_elapsed = (time.perf_counter() - fallback_start) * 1000
-        # Don't apply threshold filtering for fallback
-        final_results = fulltext_results[:top_k]
-        logger.info("[RAG PERF] Fallback: {} results, elapsed={:.1f}ms", len(final_results), fallback_elapsed)
-        return final_results
+            return []
 
     def _step2_context_expansion(self, core_results: List[SearchResult]) -> List[ChunkInfo]:
         """Step 2: Expand context around core chunks."""
@@ -524,9 +556,12 @@ class AdvancedSearchPipeline(AdvancedRetriever):
         key_bytes += f":bm25t={self.config.bm25_threshold}".encode("utf-8")
         key_bytes += f":vectort={self.config.vector_threshold}".encode("utf-8")
         key_bytes += f":rrfk={self.config.rrf_k}".encode("utf-8")
+        key_bytes += f":enable_bm25={self.config.enable_bm25}".encode("utf-8")
+        key_bytes += f":enable_vector={self.config.enable_vector}".encode("utf-8")
         key_bytes += f":rerank={self.config.enable_rerank}".encode("utf-8")
         key_bytes += f":rerankt={self.config.rerank_threshold}".encode("utf-8")
         key_bytes += f":dedupt={self.config.dedup_threshold}".encode("utf-8")
         key_bytes += f":ctxexpand={self.config.enable_context_expansion}".encode("utf-8")
         key_bytes += f":doclevel={self.config.enable_document_level}".encode("utf-8")
+        key_bytes += f":queryexpand={self.config.enable_query_expand}".encode("utf-8")
         return hashlib.sha256(key_bytes).hexdigest()
