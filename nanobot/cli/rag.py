@@ -7,7 +7,6 @@ from typing import Optional
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
 from nanobot import __logo__
 
@@ -47,7 +46,6 @@ def rag_refresh():
         raise typer.Exit(1)
 
     async def scan():
-        """Scan docs for rag_scan command."""
         return await store.scan_and_index(
             docs_dir,
             min_chunk_size=rag_config.min_chunk_size,
@@ -94,7 +92,6 @@ def rag_rebuild():
     console.print(f"Docs dir: {docs_dir}")
     console.print(f"Database: {db_path}\n")
 
-    # Delete existing database if it exists
     if db_path.exists():
         console.print(f"[red]Deleting existing index: {db_path}[/red]")
         if not typer.confirm("Continue?"):
@@ -103,7 +100,6 @@ def rag_rebuild():
         db_path.unlink()
         console.print("[green]✓[/green] Deleted existing index\n")
 
-    # Rebuild index
     try:
         embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
         store = DocumentStore(db_path, embedding_provider, rag_config)
@@ -113,7 +109,6 @@ def rag_rebuild():
         raise typer.Exit(1)
 
     async def scan():
-        """Scan docs for rag_rebuild command."""
         return await store.scan_and_index(
             docs_dir,
             min_chunk_size=rag_config.min_chunk_size,
@@ -161,11 +156,10 @@ def rag_status():
 
     console.print(f"\nDocs dir: {docs_dir}")
     if docs_dir.exists():
-        # Only count supported document types
         supported_extensions = {".pdf", ".md", ".markdown", ".docx", ".doc", ".txt"}
         count = sum(1 for _ in docs_dir.rglob("*")
-                      if _.is_file() and not _.name.startswith(".")
-                      and _.suffix.lower() in supported_extensions)
+                    if _.is_file() and not _.name.startswith(".")
+                    and _.suffix.lower() in supported_extensions)
         console.print(f"  Files in docs: {count}")
     else:
         console.print("  [yellow]Docs directory not found[/yellow]")
@@ -180,14 +174,12 @@ def rag_status():
         raise typer.Exit(0)
 
     try:
-        # Try to load with embedding provider if possible to check vector status
         store = None
         try:
             from nanobot.rag import SentenceTransformerEmbeddingProvider
             embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
             store = DocumentStore(db_path, embedding_provider, rag_config)
         except (ImportError, Exception):
-            # Fall back to no embedding provider
             store = DocumentStore(db_path)
 
         stats = store.get_stats()
@@ -221,10 +213,7 @@ def rag_search(
 ):
     """Search indexed documents using semantic search."""
     from nanobot.config.loader import load_config
-    from nanobot.rag import (
-        DocumentStore,
-        SentenceTransformerEmbeddingProvider,
-    )
+    from nanobot.rag import DocumentStore, SentenceTransformerEmbeddingProvider
 
     config = load_config()
     workspace = config.workspace_path
@@ -275,38 +264,127 @@ def rag_search(
     store.close()
 
 
-@rag_app.command("eval")
-def rag_eval(
+@rag_app.command("eval-gen")
+def rag_eval_gen(
     num_samples: int = typer.Option(50, "--num-samples", "-n", help="Number of test samples to generate"),
-    include_baseline: bool = typer.Option(True, "--baseline/--no-baseline", help="Include BM25 baseline comparison"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output path (default: ~/.nanobot/workspace/rag/eval/<timestamp>.json)"),
     min_chunk_length: int = typer.Option(200, "--min-chunk-length", help="Minimum chunk length for sampling"),
     random_seed: int = typer.Option(42, "--seed", help="Random seed for reproducibility"),
+):
+    """
+    Generate test dataset using LLM to create realistic user queries.
+
+    The generated queries will be saved to a JSON file and can be used
+    with 'nanobot rag eval' for evaluation.
+    """
+    from datetime import datetime
+    from nanobot.config.loader import load_config
+    from nanobot.rag import DocumentStore, SentenceTransformerEmbeddingProvider
+    from nanobot.rag.evaluation import DataGenerator, TestDatasetManager
+
+    config = load_config()
+    workspace = config.workspace_path
+    rag_config = config.rag
+
+    console.print(f"{__logo__} Test Dataset Generation\n")
+
+    if not rag_config.enabled:
+        console.print("[yellow]RAG is disabled in config[/yellow]")
+        raise typer.Exit(1)
+
+    db_path = workspace / "rag" / "docs.db"
+
+    if not db_path.exists():
+        console.print("[red]No index found. Run 'nanobot rag refresh' first.[/red]")
+        raise typer.Exit(1)
+
+    # Initialize LLM provider using _make_provider pattern
+    try:
+        from nanobot.cli.commands import _make_provider
+        llm_provider = _make_provider(config)
+        console.print(f"[green]✓[/green] LLM provider initialized")
+    except Exception as e:
+        console.print(f"[red]Failed to initialize LLM provider: {e}[/red]")
+        console.print("Will use fallback generation method (basic keyword extraction)")
+        llm_provider = None
+
+    # Initialize embedding provider for precomputation
+    try:
+        embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
+    except ImportError as e:
+        console.print(f"[red]RAG dependencies not installed: {e}[/red]")
+        console.print("Install with: pip install 'nanobot-ai[rag]'")
+        raise typer.Exit(1)
+
+    try:
+        store = DocumentStore(db_path, embedding_provider, rag_config)
+    except Exception as e:
+        console.print(f"[red]Failed to open document store: {e}[/red]")
+        raise typer.Exit(1)
+
+    async def generate():
+        # Generate queries using LLM
+        generator = DataGenerator(store, llm_provider, embedding_provider)
+        queries = await generator.generate(
+            num_samples=num_samples,
+            min_chunk_length=min_chunk_length,
+            random_seed=random_seed,
+        )
+
+        if not queries:
+            console.print("[yellow]No suitable chunks found for evaluation[/yellow]")
+            return None
+
+        # Precompute embeddings
+        console.print(f"Precomputing embeddings for {len(queries)} queries...")
+        queries = await generator.precompute_embeddings(queries)
+
+        # Save dataset
+        dataset_mgr = TestDatasetManager()
+        dataset = TestDatasetManager.create_dataset(queries)
+
+        save_path = dataset_mgr.save(dataset, output)
+
+        return save_path, len(queries)
+
+    with console.status("Generating test dataset...", spinner="dots"):
+        result = asyncio.run(generate())
+
+    if result is None:
+        store.close()
+        raise typer.Exit(1)
+
+    save_path, count = result
+    console.print(f"\n[green]✓[/green] Generated {count} test queries")
+    console.print(f"  Saved to: {save_path}")
+    console.print("\nRun evaluation with:")
+    console.print(f"  nanobot rag eval --dataset {save_path}")
+
+    store.close()
+
+
+@rag_app.command("eval")
+def rag_eval(
+    dataset: Path = typer.Option(..., "--dataset", "-d", help="Path to test dataset JSON file"),
+    include_baseline: bool = typer.Option(True, "--baseline/--no-baseline", help="Include BM25 baseline comparison"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Save results to JSON file"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed results"),
     ablation: bool = typer.Option(False, "--ablation", "-a", help="Run ablation study to test component contributions"),
-    analyze: bool = typer.Option(False, "--analyze", help="Enable deep failure case analysis"),
 ):
     """
-    Evaluate RAG retrieval performance.
+    Evaluate RAG retrieval performance using a pre-generated test dataset.
 
-    Provides comprehensive evaluation including:
-    - Core metrics (Recall@5, MRR, Hit Rate@5)
-    - Difficulty and failure breakdowns
-    - Optional ablation study (--ablation) to measure component contributions
-    - Optional deep failure analysis (--analyze)
+    Use 'nanobot rag eval-gen' first to generate a test dataset.
     """
     from nanobot.config.loader import load_config
-    from nanobot.rag import (
-        DocumentStore,
-        SentenceTransformerEmbeddingProvider,
-    )
+    from nanobot.rag import DocumentStore, SentenceTransformerEmbeddingProvider
     from nanobot.rag.evaluation import (
-        DataGenerator,
-        EvalConfig,
-        RAGEvaluator,
-        AblationStudy,
         ABLATION_CONFIGS,
+        AblationStudy,
+        EvalConfig,
         ReportGenerator,
+        RAGEvaluator,
+        TestDatasetManager,
     )
 
     config = load_config()
@@ -325,56 +403,63 @@ def rag_eval(
         console.print("[red]No index found. Run 'nanobot rag refresh' first.[/red]")
         raise typer.Exit(1)
 
+    if not dataset.exists():
+        console.print(f"[red]Dataset file not found: {dataset}[/red]")
+        raise typer.Exit(1)
+
+    # Load test dataset
+    try:
+        dataset_mgr = TestDatasetManager()
+        test_dataset = dataset_mgr.load(dataset)
+        console.print(f"Loaded dataset: {test_dataset.version}")
+        console.print(f"Queries: {test_dataset.num_queries}")
+    except Exception as e:
+        console.print(f"[red]Failed to load dataset: {e}[/red]")
+        raise typer.Exit(1)
+
+    # Initialize embedding provider
     try:
         embedding_provider = SentenceTransformerEmbeddingProvider(rag_config.embedding_model)
-        store = DocumentStore(db_path, embedding_provider, rag_config)
     except ImportError as e:
         console.print(f"[red]RAG dependencies not installed: {e}[/red]")
         console.print("Install with: pip install 'nanobot-ai[rag]'")
         raise typer.Exit(1)
 
-    # Store queries and baseline results for verbose output
-    eval_queries = []
-    baseline_results_cache = {}
-    ablation_results = None
+    try:
+        store = DocumentStore(db_path, embedding_provider, rag_config)
+    except Exception as e:
+        console.print(f"[red]Failed to open document store: {e}[/red]")
+        raise typer.Exit(1)
 
     async def run_evaluation():
-        nonlocal eval_queries, baseline_results_cache, ablation_results
+        nonlocal ablation_results
 
-        # Step 1: Generate test data
-        console.print(f"Generating {num_samples} test queries...")
-        generator = DataGenerator(store, embedding_provider)
-        queries = generator.generate_basic(
-            num_samples=num_samples,
-            min_chunk_length=min_chunk_length,
-            random_seed=random_seed,
-        )
-
-        eval_queries = queries
-
-        if not queries:
-            console.print("[yellow]No suitable chunks found for evaluation[/yellow]")
-            return None, None
-
-        # Precompute embeddings
-        console.print(f"Precomputing embeddings for {len(queries)} queries...")
-        queries = await generator.precompute_embeddings(queries)
-
-        # Clear search cache AND disable caching BEFORE any search to ensure fresh evaluation
-        console.print("[bold]Clearing search cache and disabling cache for evaluation...[/bold]")
+        # Clear cache and disable it for fresh evaluation
         store.clear_cache()
         original_cache_setting = rag_config.enable_search_cache
         rag_config.enable_search_cache = False
-        console.print(f"  - Cache cleared. Original setting was: {original_cache_setting}, now set to: False")
 
-        # Step 2: Run ablation study if requested
+        # Precompute embeddings for queries
+        queries = test_dataset.queries
+
+        console.print("Precomputing embeddings...")
+        for i in range(0, len(queries), 10):
+            batch = queries[i:i + 10]
+            batch_embeddings = await embedding_provider.embed_batch([q.golden_context for q in batch])
+            for q, emb in zip(batch, batch_embeddings):
+                q.golden_embedding = emb
+
+        eval_config = EvalConfig(random_seed=42)
+
+        # Run ablation study if requested
+        ablation_results = None
         if ablation:
             console.print("\n[bold]Running Ablation Study[/bold]")
             console.print(f"Testing {len(ABLATION_CONFIGS)} configurations...")
             ablation_study = AblationStudy(
                 store,
                 embedding_provider,
-                eval_config=EvalConfig(random_seed=random_seed),
+                eval_config=eval_config,
                 rag_config=rag_config,
             )
             ablation_results = await ablation_study.run_ablation(
@@ -382,52 +467,31 @@ def rag_eval(
                 ablation_configs=ABLATION_CONFIGS,
                 include_baseline=False,
             )
-        else:
-            ablation_results = None
 
-        # Step 3: Run main evaluation (on full pipeline)
-        console.print("\nRunning main evaluation...")
-        eval_config = EvalConfig(random_seed=random_seed)
+        # Run main evaluation
         evaluator = RAGEvaluator(store, embedding_provider, eval_config)
-        summary = await evaluator.evaluate(
-            queries,
-            include_baseline=include_baseline,
-        )
+        summary = await evaluator.evaluate(queries, include_baseline=include_baseline)
 
-        # Restore original cache setting
+        # Restore cache setting
         rag_config.enable_search_cache = original_cache_setting
 
-        # If verbose, collect baseline results for comparison
-        if verbose and include_baseline:
-            console.print("Collecting detailed baseline results...")
-            from nanobot.rag.evaluation.baseline import BaselineRetriever
-            baseline = BaselineRetriever(store.connection)
-            for query in queries:
-                baseline_results_cache[query.id] = await baseline.search_bm25(query.query, top_k=5)
+        return summary
 
-        return summary, ablation_results
-
+    ablation_results = None
     with console.status("Running evaluation...", spinner="dots"):
-        summary, ablation_results = asyncio.run(run_evaluation())
+        summary = asyncio.run(run_evaluation())
 
-    if summary is None:
-        store.close()
-        raise typer.Exit(1)
-
-    # Use ReportGenerator for beautiful output
+    # Generate and print report
     report_gen = ReportGenerator()
-
-    # Print full report
     full_report = report_gen.generate_full_report(
         summary,
-        eval_queries,
+        test_dataset.queries,
         ablation_results=ablation_results if ablation else None,
         ablation_configs=ABLATION_CONFIGS if ablation else None,
-        show_failure_analysis=analyze,
     )
     console.print(full_report)
 
-    # Verbose: detailed results
+    # Verbose output
     if verbose and summary.details:
         console.print("\n[bold]Detailed Results[/bold]\n")
         for result in summary.details:
@@ -441,85 +505,56 @@ def rag_eval(
             console.print(f"{status} {result.query}{reason}{baseline_info}")
             if result.failure_reason:
                 console.print(f"    Reason: {result.failure_reason}")
-            if result.found_chunk_ids:
-                console.print(f"    Found chunk IDs: {result.found_chunk_ids}")
-            # Find the query to show source chunk
-            query = next((q for q in eval_queries if q.id == result.query_id), None)
-            if query:
-                console.print(f"    Expected chunk ID: {query.source_chunk_id}")
-                console.print(f"    Source doc: {query.source_doc}")
             console.print()
 
-    # Save to file
+    # Save results
     if output:
         output_data = {
-            "dataset_name": summary.dataset_name,
+            "dataset_version": test_dataset.version,
+            "dataset_path": str(dataset),
             "num_queries": summary.num_queries,
-            "config": {
-                "strong_threshold": summary.config.strong_threshold,
-                "weak_threshold": summary.config.weak_threshold,
-                "top_k": summary.config.top_k,
-                "random_seed": summary.config.random_seed,
-            },
-            "rag_config": {
-                "bm25_threshold": rag_config.bm25_threshold,
-                "vector_threshold": rag_config.vector_threshold,
-                "rrf_k": rag_config.rrf_k,
-            },
             "metrics": {
-                "recall_at_5": summary.recall_at_5,
+                "recall_at_k": summary.recall_at_k,
                 "mrr": summary.mrr,
-                "hit_rate_at_5": summary.hit_rate_at_5,
+                "hit_rate_at_k": summary.hit_rate_at_k,
+                "ndcg_at_k": summary.ndcg_at_k,
                 "avg_latency_ms": summary.avg_latency_ms,
-                "baseline_recall_at_5": summary.baseline_recall_at_5,
+                "baseline_recall_at_k": summary.baseline_recall_at_k,
                 "baseline_mrr": summary.baseline_mrr,
+                "baseline_ndcg_at_k": summary.baseline_ndcg_at_k,
             },
-            "difficulty_breakdown": summary.difficulty_breakdown,
-            "failure_breakdown": summary.failure_breakdown,
+            "question_type_breakdown": summary.question_type_breakdown,
         }
 
-        # Add ablation results if available
         if ablation and ablation_results:
-            ablation_data = {}
-            for name, abl_summary in ablation_results.items():
-                ablation_data[name] = {
-                    "recall_at_5": abl_summary.recall_at_5,
-                    "mrr": abl_summary.mrr,
-                    "hit_rate_at_5": abl_summary.hit_rate_at_5,
-                    "avg_latency_ms": abl_summary.avg_latency_ms,
+            output_data["ablation_study"] = {
+                name: {
+                    "recall_at_k": s.recall_at_k,
+                    "mrr": s.mrr,
+                    "ndcg_at_k": s.ndcg_at_k,
+                    "avg_latency_ms": s.avg_latency_ms,
                 }
-            output_data["ablation_study"] = ablation_data
+                for name, s in ablation_results.items()
+            }
 
-        # Add detailed per-query data if verbose
         if verbose and summary.details:
-            detailed_queries = []
+            detailed_results = []
+            queries_map = {q.id: q for q in test_dataset.queries}
             for result in summary.details:
-                query = next((q for q in eval_queries if q.id == result.query_id), None)
-                query_data = {
+                query = queries_map.get(result.query_id)
+                data = {
                     "query_id": result.query_id,
                     "query": result.query,
                     "hit": result.hit,
                     "hit_rank": result.hit_rank,
-                    "hit_reason": result.hit_reason,
-                    "failure_reason": result.failure_reason,
-                    "best_similarity": result.best_similarity,
-                    "found_chunk_ids": result.found_chunk_ids,
                     "latency_ms": result.latency_ms,
                     "baseline_hit": result.baseline_hit,
-                    "baseline_hit_rank": result.baseline_hit_rank,
                 }
                 if query:
-                    query_data["source_chunk_id"] = query.source_chunk_id
-                    query_data["source_doc"] = query.source_doc
-                    query_data["golden_context"] = query.golden_context
-                # Add baseline results if available
-                if result.query_id in baseline_results_cache:
-                    query_data["baseline_results"] = [
-                        {"chunk_id": r.chunk.id, "content": r.chunk.content[:100] if r.chunk.content else None}
-                        for r in baseline_results_cache[result.query_id]
-                    ]
-                detailed_queries.append(query_data)
-            output_data["detailed_queries"] = detailed_queries
+                    data["source_chunk_id"] = query.source_chunk_id
+                    data["question_type"] = query.question_type
+                detailed_results.append(data)
+            output_data["details"] = detailed_results
 
         output.write_text(json.dumps(output_data, indent=2, ensure_ascii=False), encoding="utf-8")
         console.print(f"\n[green]✓[/green] Results saved to {output}")

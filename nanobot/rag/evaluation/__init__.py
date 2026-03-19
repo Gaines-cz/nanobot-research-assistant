@@ -6,8 +6,10 @@ from nanobot.rag.evaluation.base import (
     EvalQuery,
     EvalResult,
     EvalSummary,
+    TestDataset,
 )
 from nanobot.rag.evaluation.baseline import BaselineRetriever
+from nanobot.rag.evaluation.dataset import TestDatasetManager
 from nanobot.rag.evaluation.evaluator import AblationStudy, RAGEvaluator
 from nanobot.rag.evaluation.generator import DataGenerator
 from nanobot.rag.evaluation.judge import ResultJudge
@@ -24,7 +26,9 @@ __all__ = [
     "EvalResult",
     "EvalSummary",
     "EvalConfig",
+    "TestDataset",
     "DataGenerator",
+    "TestDatasetManager",
     "ResultJudge",
     "MetricsCalculator",
     "BaselineRetriever",

@@ -6,15 +6,9 @@ from typing import Dict, List, Optional
 
 from loguru import logger
 
-from nanobot.config.schema import RAGConfig
 from nanobot.rag.embeddings import EmbeddingProvider
 from nanobot.rag.evaluation.ablation import AblationConfig, ABLATION_CONFIGS
-from nanobot.rag.evaluation.base import (
-    EvalConfig,
-    EvalQuery,
-    EvalResult,
-    EvalSummary,
-)
+from nanobot.rag.evaluation.base import EvalConfig, EvalQuery, EvalResult, EvalSummary
 from nanobot.rag.evaluation.baseline import BaselineRetriever
 from nanobot.rag.evaluation.judge import ResultJudge
 from nanobot.rag.evaluation.metrics import MetricsCalculator
@@ -42,12 +36,11 @@ class RAGEvaluator:
         self.embedding_provider = embedding_provider
         self.config = config or EvalConfig()
         self.judge = ResultJudge(
-            strong_threshold=self.config.strong_threshold,
-            weak_threshold=self.config.weak_threshold,
             db_connection=doc_store.connection if doc_store else None,
         )
         self.metrics = MetricsCalculator()
         self.baseline = BaselineRetriever(doc_store.connection) if doc_store else None
+        self.k = self.config.top_k
 
     async def evaluate(
         self,
@@ -72,10 +65,11 @@ class RAGEvaluator:
             if idx % 10 == 0:
                 logger.info("Evaluating query {}/{}", idx + 1, len(queries))
 
-            result = await self._evaluate_single(
-                query, include_baseline
-            )
+            result = await self._evaluate_single(query, include_baseline)
             details.append(result)
+
+        # Build queries map for breakdown calculation
+        queries_map = {q.id: q for q in queries}
 
         # Calculate summary metrics
         summary = EvalSummary(
@@ -83,30 +77,26 @@ class RAGEvaluator:
             num_queries=len(queries),
             config=self.config,
             random_seed=self.config.random_seed,
-            recall_at_5=self.metrics.recall_at_k(details, 5),
+            recall_at_k=self.metrics.recall_at_k(details, self.k),
             mrr=self.metrics.mrr(details),
-            hit_rate_at_5=self.metrics.hit_rate_at_k(details, 5),
+            hit_rate_at_k=self.metrics.hit_rate_at_k(details, self.k),
+            ndcg_at_k=self.metrics.ndcg_at_k(details, self.k),
             avg_latency_ms=self.metrics.avg_latency(details),
+            question_type_breakdown=self.metrics.question_type_breakdown(details, queries_map),
             details=details,
         )
 
         # Baseline comparison
         if include_baseline and self.baseline:
-            summary.baseline_recall_at_5 = self.metrics.recall_at_k(
-                details, 5, use_baseline=True
-            )
-            summary.baseline_mrr = self.metrics.mrr(
-                details, use_baseline=True
-            )
-
-        # Extended metrics
-        summary.difficulty_breakdown = self.metrics.difficulty_breakdown(details)
-        summary.failure_breakdown = self.metrics.failure_breakdown(details)
+            summary.baseline_recall_at_k = self.metrics.recall_at_k(details, self.k, use_baseline=True)
+            summary.baseline_mrr = self.metrics.mrr(details, use_baseline=True)
+            summary.baseline_ndcg_at_k = self.metrics.ndcg_at_k(details, self.k, use_baseline=True)
 
         logger.info("Evaluation complete!")
-        logger.info("  Recall@5: {:.4f}", summary.recall_at_5)
+        logger.info("  Recall@{}: {:.4f}", self.k, summary.recall_at_k)
         logger.info("  MRR: {:.4f}", summary.mrr)
-        logger.info("  Hit Rate@5: {:.4f}", summary.hit_rate_at_5)
+        logger.info("  Hit Rate@{}: {:.4f}", self.k, summary.hit_rate_at_k)
+        logger.info("  NDCG@{}: {:.4f}", self.k, summary.ndcg_at_k)
         logger.info("  Avg Latency: {:.2f}ms", summary.avg_latency_ms)
 
         return summary
@@ -119,8 +109,8 @@ class RAGEvaluator:
         """Evaluate a single query."""
         start_time = time.time()
 
-        # Execute search (explicit top_k=5 for Recall@5 and Hit Rate@5 metrics)
-        results = await self.doc_store.search_advanced(query.query, top_k=5)
+        # Execute search
+        results = await self.doc_store.search_advanced(query.query, top_k=self.k)
         latency_ms = (time.time() - start_time) * 1000
 
         # Extract result info
@@ -144,33 +134,26 @@ class RAGEvaluator:
                     break
             # If not found and we have a hit_reason, parse rank from it
             if hit_rank is None and hit_reason:
-                # Parse rank from hit_reason like "id_match_rank_1" or "parent_id_match_rank_2"
                 match = re.search(r'_rank_(\d+)', hit_reason)
                 if match:
                     hit_rank = int(match.group(1))
 
-        # Baseline result - use same judge logic
+        # Baseline result
         baseline_hit = None
         baseline_hit_rank = None
         if include_baseline and self.baseline:
-            baseline_results = await self.baseline.search_bm25(
-                query.query, top_k=5
-            )
+            baseline_results = await self.baseline.search_bm25(query.query, top_k=self.k)
             if baseline_results:
-                # Apply the same judge to baseline results
                 baseline_hit_result, baseline_hit_reason, _, _ = self.judge.judge(
                     baseline_results, query, golden_embedding
                 )
                 baseline_hit = baseline_hit_result
 
-                # Determine baseline hit_rank
                 if baseline_hit and query.source_chunk_id:
-                    # Try direct ID match first
                     for i, r in enumerate(baseline_results):
                         if r.chunk.id == query.source_chunk_id:
                             baseline_hit_rank = i + 1
                             break
-                    # If not found and we have a hit_reason, parse rank from it
                     if baseline_hit_rank is None and baseline_hit_reason:
                         match = re.search(r'_rank_(\d+)', baseline_hit_reason)
                         if match:
@@ -183,11 +166,10 @@ class RAGEvaluator:
             hit_rank=hit_rank,
             hit_reason=hit_reason,
             failure_reason=failure_reason,
-            similarity_scores=None,  # Can be populated later if needed
+            similarity_scores=None,
             best_similarity=best_similarity,
             found_chunk_ids=found_chunk_ids,
             latency_ms=latency_ms,
-            difficulty=query.difficulty,
             baseline_hit=baseline_hit,
             baseline_hit_rank=baseline_hit_rank,
         )
@@ -195,10 +177,10 @@ class RAGEvaluator:
 
 class AblationStudy:
     """
-    Ablation study executor for RAG pipeline.
+    Ablation study to measure contribution of each pipeline component.
 
-    Systematically tests the contribution of each component by
-    disabling them one by one and measuring the impact on performance.
+    Runs evaluation with different configurations to understand
+    the impact of each RAG pipeline component.
     """
 
     def __init__(
@@ -206,123 +188,74 @@ class AblationStudy:
         doc_store: DocumentStore,
         embedding_provider: Optional[EmbeddingProvider] = None,
         eval_config: Optional[EvalConfig] = None,
-        rag_config: Optional[RAGConfig] = None,
+        rag_config=None,
     ):
-        """
-        Initialize ablation study.
-
-        Args:
-            doc_store: Document store for retrieval
-            embedding_provider: Embedding provider
-            eval_config: Evaluation configuration
-            rag_config: RAG configuration (will be modified during study)
-        """
         self.doc_store = doc_store
         self.embedding_provider = embedding_provider
         self.eval_config = eval_config or EvalConfig()
         self.rag_config = rag_config
+        self.k = self.eval_config.top_k
+        self.metrics = MetricsCalculator()
 
     async def run_ablation(
         self,
         queries: List[EvalQuery],
-        ablation_configs: Optional[List[AblationConfig]] = None,
+        ablation_configs: List[AblationConfig] = None,
         include_baseline: bool = False,
     ) -> Dict[str, EvalSummary]:
         """
-        Run ablation study with specified configurations.
+        Run ablation study with multiple configurations.
 
         Args:
-            queries: List of evaluation queries
-            ablation_configs: List of ablation configurations (uses predefined if None)
-            include_baseline: Whether to include BM25 baseline in each run
+            queries: Test queries
+            ablation_configs: List of configurations to test
+            include_baseline: Whether to include baseline metrics
 
         Returns:
-            Dictionary mapping config names to EvalSummary
+            Dict mapping config name to EvalSummary
         """
-        from loguru import logger
-
         if ablation_configs is None:
             ablation_configs = ABLATION_CONFIGS
 
-        results = {}
+        results: Dict[str, EvalSummary] = {}
 
-        # Backup original RAG config
-        original_config = self._backup_rag_config()
+        # Store original config
+        original_rag_config = None
+        if self.rag_config:
+            original_rag_config = {
+                'enable_bm25': self.rag_config.enable_bm25,
+                'enable_vector': self.rag_config.enable_vector,
+                'enable_query_expand': self.rag_config.enable_query_expand,
+                'enable_context_expansion': self.rag_config.enable_context_expansion,
+                'enable_document_level': self.rag_config.enable_document_level,
+                'enable_rerank': self.rag_config.enable_rerank,
+            }
 
-        try:
-            for i, ablation_cfg in enumerate(ablation_configs):
-                logger.info(
-                    "Running ablation {}/{}: {}",
-                    i + 1, len(ablation_configs), ablation_cfg.name
-                )
+        for config in ablation_configs:
+            logger.info("Running ablation: {}", config.name)
 
-                # Apply ablation configuration
-                self._apply_ablation_config(ablation_cfg)
+            # Apply ablation config
+            if self.rag_config and hasattr(config, 'apply_to_rag_config'):
+                config.apply_to_rag_config(self.rag_config)
 
-                # Clear cache to ensure fresh runs
-                self.doc_store.clear_cache()
+            # Evaluate with this config
+            evaluator = RAGEvaluator(
+                self.doc_store,
+                self.embedding_provider,
+                self.eval_config,
+            )
 
-                # Run evaluation
-                evaluator = RAGEvaluator(
-                    self.doc_store,
-                    self.embedding_provider,
-                    self.eval_config
-                )
-                summary = await evaluator.evaluate(
-                    queries,
-                    include_baseline=include_baseline
-                )
-                results[ablation_cfg.name] = summary
+            summary = await evaluator.evaluate(queries, include_baseline=False)
+            summary.dataset_name = config.name
+            results[config.name] = summary
 
-                logger.info(
-                    "  {} completed: Recall@5={:.4f}, MRR={:.4f}, Latency={:.2f}ms",
-                    ablation_cfg.name,
-                    summary.recall_at_5,
-                    summary.mrr,
-                    summary.avg_latency_ms
-                )
-
-        finally:
-            # Restore original configuration
-            self._restore_rag_config(original_config)
+        # Restore original config
+        if self.rag_config and original_rag_config:
+            self.rag_config.enable_bm25 = original_rag_config['enable_bm25']
+            self.rag_config.enable_vector = original_rag_config['enable_vector']
+            self.rag_config.enable_query_expand = original_rag_config['enable_query_expand']
+            self.rag_config.enable_context_expansion = original_rag_config['enable_context_expansion']
+            self.rag_config.enable_document_level = original_rag_config['enable_document_level']
+            self.rag_config.enable_rerank = original_rag_config['enable_rerank']
 
         return results
-
-    def _backup_rag_config(self) -> Optional[Dict]:
-        """Backup current RAG configuration."""
-        if self.rag_config is None:
-            return None
-
-        return {
-            "enable_bm25": self.rag_config.enable_bm25,
-            "enable_vector": self.rag_config.enable_vector,
-            "enable_context_expansion": self.rag_config.enable_context_expansion,
-            "enable_document_level": self.rag_config.enable_document_level,
-            "enable_rerank": self.rag_config.enable_rerank,
-            "enable_query_expand": self.rag_config.enable_query_expand,
-            "enable_search_cache": self.rag_config.enable_search_cache,
-        }
-
-    def _restore_rag_config(self, backup: Optional[Dict]) -> None:
-        """Restore RAG configuration from backup."""
-        if backup is None or self.rag_config is None:
-            return
-
-        self.rag_config.enable_bm25 = backup["enable_bm25"]
-        self.rag_config.enable_vector = backup["enable_vector"]
-        self.rag_config.enable_context_expansion = backup["enable_context_expansion"]
-        self.rag_config.enable_document_level = backup["enable_document_level"]
-        self.rag_config.enable_rerank = backup["enable_rerank"]
-        self.rag_config.enable_query_expand = backup["enable_query_expand"]
-        self.rag_config.enable_search_cache = backup["enable_search_cache"]
-
-    def _apply_ablation_config(self, ablation_cfg: AblationConfig) -> None:
-        """Apply an ablation configuration to the RAG config."""
-        if self.rag_config is None:
-            return
-
-        # Apply config settings
-        ablation_cfg.apply_to_rag_config(self.rag_config)
-
-        # Disable cache for ablation studies to ensure consistent results
-        self.rag_config.enable_search_cache = False

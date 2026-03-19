@@ -1,4 +1,4 @@
-"""RAG Evaluation - Test data generator (basic + LLM-enhanced)."""
+"""RAG Evaluation - Test data generator with LLM."""
 
 import random
 import re
@@ -11,47 +11,172 @@ from nanobot.rag.evaluation.base import EvalQuery
 from nanobot.rag.store import DocumentStore
 
 
+# Prompt templates for different question types (Chinese)
+PROMPT_TEMPLATES_ZH = {
+    "factoid": """你是一个研究助手。请根据以下文档片段，生成一个用户可能会问的事实型问题。
+
+要求：
+1. 难度：中高难度
+2. 问题要自然，像真实用户提问
+3. 不要直接复制文档内容
+4. 使用与文档相同的语言（中文）
+5. 问题答案应能从文档中找到
+
+示例：
+文档：nanobot 是一个基于 LLM 的 AI 助手框架，使用 Python 开发。
+问题：nanobot 是用什么语言开发的？
+
+文档：
+{chunk_content}
+
+生成的问题（仅输出问题本身）：""",
+
+    "summary": """你是一个研究助手。请根据以下文档片段，生成一个用户可能会问的摘要型问题。
+
+要求：
+1. 难度：中高难度
+2. 问题要自然，像真实用户提问
+3. 不要直接复制文档内容
+4. 使用与文档相同的语言（中文）
+5. 问题答案应能从文档中找到
+
+示例：
+文档：RAG 是检索增强生成技术，结合了检索系统和生成模型的优势。
+问题：RAG 技术结合了哪些系统的优势？
+
+文档：
+{chunk_content}
+
+生成的问题（仅输出问题本身）：""",
+
+    "analytical": """你是一个研究助手。请根据以下文档片段，生成一个用户可能会问的分析型问题。
+
+要求：
+1. 难度：中高难度
+2. 问题要自然，像真实用户提问
+3. 不要直接复制文档内容
+4. 使用与文档相同的语言（中文）
+5. 问题答案应能从文档中找到
+
+示例：
+文档：向量数据库通过嵌入向量进行语义检索，比关键词搜索更能理解语义。
+问题：向量数据库为什么能更好地理解语义？
+
+文档：
+{chunk_content}
+
+生成的问题（仅输出问题本身）：""",
+}
+
+# Prompt templates for different question types (English)
+PROMPT_TEMPLATES_EN = {
+    "factoid": """You are a research assistant. Generate a factoid question based on the following document.
+
+Requirements:
+1. Difficulty: medium to high
+2. Natural, like a real user question
+3. Don't copy the document content directly
+4. Use the same language as the document (English)
+5. The answer should be findable in the document
+
+Example:
+Document: nanobot is an LLM-based AI assistant framework written in Python.
+Question: What programming language is nanobot written in?
+
+Document:
+{chunk_content}
+
+Question (only output the question itself):""",
+
+    "summary": """You are a research assistant. Generate a summary question based on the following document.
+
+Requirements:
+1. Difficulty: medium to high
+2. Natural, like a real user question
+3. Don't copy the document content directly
+4. Use the same language as the document (English)
+5. The answer should be findable in the document
+
+Example:
+Document: RAG is retrieval-augmented generation, combining the strengths of retrieval systems and generative models.
+Question: What systems does RAG combine?
+
+Document:
+{chunk_content}
+
+Question (only output the question itself):""",
+
+    "analytical": """You are a research assistant. Generate an analytical question based on the following document.
+
+Requirements:
+1. Difficulty: medium to high
+2. Natural, like a real user question
+3. Don't copy the document content directly
+4. Use the same language as the document (English)
+5. The answer should be findable in the document
+
+Example:
+Document: Vector databases use embedded vectors for semantic search, understanding semantics better than keyword search.
+Question: Why can vector databases better understand semantics?
+
+Document:
+{chunk_content}
+
+Question (only output the question itself):""",
+}
+
+QUESTION_TYPES = ["factoid", "summary", "analytical"]
+
+
+def detect_language(text: str) -> str:
+    """Detect if text is primarily Chinese or English."""
+    # Count Chinese characters
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    # Count English words (rough estimate)
+    english_words = len(re.findall(r'[a-zA-Z]+', text))
+
+    # If Chinese chars > 10% of English words, consider it Chinese
+    if chinese_chars > english_words * 0.1:
+        return "zh"
+    return "en"
+
+
 class DataGenerator:
     """
-    Test data generator for RAG evaluation.
+    Test data generator using LLM to generate realistic user queries.
 
-    Supports two modes:
-    - Basic: Extract from middle of chunk + keyword-to-question (zero cost)
-    - LLM-enhanced: LLM generates real questions (higher quality, optional cost)
+    Supports generating factoid, summary, and analytical questions
+    with language-aware prompts (Chinese/English).
     """
 
     def __init__(
         self,
         doc_store: DocumentStore,
+        llm_provider=None,  # LLM provider for generation
         embedding_provider: Optional[EmbeddingProvider] = None,
     ):
         self.doc_store = doc_store
+        self.llm_provider = llm_provider
         self.embedding_provider = embedding_provider
 
-    def generate_basic(
+    async def generate(
         self,
         num_samples: int = 50,
         min_chunk_length: int = 200,
         random_seed: Optional[int] = 42,
     ) -> List[EvalQuery]:
         """
-        Generate basic test data (zero cost).
-
-        Strategy to avoid inflated metrics:
-        1. Prefer middle paragraph of chunk (not the beginning, which often has high similarity)
-        2. Extract keywords and form simple questions
+        Generate test queries using LLM.
 
         Args:
             num_samples: Number of samples to generate
             min_chunk_length: Minimum chunk length to consider
             random_seed: Random seed for reproducibility
         """
-        # Set random seed for reproducibility
         if random_seed is not None:
             random.seed(random_seed)
 
         # Get chunks from database - prefer large chunks for dual granularity
-        # Note: We don't use ORDER BY RANDOM() here because it doesn't respect Python's random.seed()
         db = self.doc_store.connection.db
         cursor = db.execute("""
             SELECT c.id, c.content, d.path, d.filename
@@ -63,18 +188,25 @@ class DataGenerator:
 
         all_chunks = cursor.fetchall()
 
-        # Shuffle in Python (respects random_seed) and take top num_samples
         if not all_chunks:
-            chunks = []
-        else:
-            random.shuffle(all_chunks)
-            chunks = all_chunks[:num_samples]
+            return []
+
+        # Shuffle and take num_samples
+        random.shuffle(all_chunks)
+        chunks = all_chunks[:num_samples]
 
         queries: List[EvalQuery] = []
 
         for idx, (chunk_id, content, doc_path, doc_filename) in enumerate(chunks):
-            # Generate query from chunk (improved: use middle paragraph)
-            query_text = self._generate_query_from_chunk_basic(content)
+            # Detect language and select appropriate question type
+            lang = detect_language(content)
+            question_type = random.choice(QUESTION_TYPES)
+
+            # Generate query using LLM or fallback to basic method
+            if self.llm_provider:
+                query_text = await self._generate_with_llm(content, question_type, lang)
+            else:
+                query_text = self._generate_fallback(content)
 
             queries.append(EvalQuery(
                 id=f"q_{idx}",
@@ -82,24 +214,46 @@ class DataGenerator:
                 golden_context=content,
                 source_chunk_id=chunk_id,
                 source_doc=doc_path,
-                golden_embedding=None,  # Will be set later by precompute_embeddings()
+                question_type=question_type,
+                tags=[],
+                golden_embedding=None,
             ))
 
-        logger.info("Generated {} basic test queries", len(queries))
+            if (idx + 1) % 10 == 0:
+                logger.info("Generated {}/{} queries", idx + 1, len(chunks))
+
+        logger.info("Generated {} test queries", len(queries))
         return queries
 
-    def _generate_query_from_chunk_basic(self, content: str) -> str:
-        """
-        Generate query from chunk (improved basic version).
+    async def _generate_with_llm(
+        self,
+        content: str,
+        question_type: str,
+        lang: str,
+    ) -> str:
+        """Generate query using LLM."""
+        templates = PROMPT_TEMPLATES_ZH if lang == "zh" else PROMPT_TEMPLATES_EN
+        prompt = templates[question_type].format(chunk_content=content)
 
-        Strategy:
-        1. Split by paragraphs
-        2. Use middle paragraph (not beginning)
-        3. Extract a meaningful phrase or use sentence directly as query
-        4. Avoid "What is <complete sentence>?" awkward format
-        5. Prefer noun phrases and natural search queries
-        """
-        # Preprocess: fix hyphenated word breaks (like "limi-\ntations" → "limitations")
+        messages = [{"role": "user", "content": prompt}]
+        response = await self.llm_provider.chat(
+            messages=messages,
+            temperature=0.7,
+            max_tokens=256,
+        )
+
+        if response.content:
+            # Clean up the response
+            query = response.content.strip()
+            # Remove quotes if present
+            query = re.sub(r'^["\'](.*)["\']$', r'\1', query)
+            return query
+
+        return self._generate_fallback(content)
+
+    def _generate_fallback(self, content: str) -> str:
+        """Fallback query generation when LLM is not available."""
+        # Preprocess: fix hyphenated word breaks
         content = self._fix_hyphenated_breaks(content)
 
         # Split by paragraphs
@@ -107,149 +261,32 @@ class DataGenerator:
         if not paragraphs:
             return content[:100]
 
-        # Prefer middle paragraph (avoid beginning)
+        # Use middle paragraph
         mid_idx = len(paragraphs) // 2
         target_para = paragraphs[mid_idx].strip()
 
-        # Split into sentences (handle . ! ?)
+        # Split into sentences
         sentences = re.split(r'(?<=[.!?])\s+', target_para)
         sentences = [s.strip() for s in sentences if s.strip()]
 
         if sentences:
             # Pick a sentence from the middle
             sent_idx = len(sentences) // 2
-            selected_sentence = sentences[sent_idx]
+            selected = sentences[sent_idx]
+            # Clean up
+            selected = re.sub(r'[.!?]+$', '', selected).strip()
+            if 10 <= len(selected) <= 150:
+                return selected
 
-            # Clean up trailing punctuation
-            selected_sentence = re.sub(r'[.!?]+$', '', selected_sentence).strip()
-
-            # If it's already a question, use as-is
-            if selected_sentence.endswith('?'):
-                return selected_sentence
-
-            # If reasonable length, try to extract a noun phrase or use as-is
-            if 15 <= len(selected_sentence) <= 150:
-                # Try to rephrase sentences that start with "This is"/"It is"/etc.
-                lowered = selected_sentence.lower()
-                if lowered.startswith(('this is', 'it is', 'that is')):
-                    # Extract the main part
-                    parts = selected_sentence.split(' ', 2)
-                    if len(parts) > 2:
-                        rest = parts[2]
-                        # If the rest is short enough, make it a question
-                        if len(rest) <= 100:
-                            return f"What is {rest}?"
-                        # Otherwise just use the rest
-                        return rest
-                elif lowered.startswith(('there is', 'there are')):
-                    parts = selected_sentence.split(' ', 2)
-                    if len(parts) > 2:
-                        rest = parts[2]
-                        if len(rest) <= 100:
-                            if lowered.startswith('there is'):
-                                return f"What is {rest}?"
-                            else:
-                                return f"What are {rest}?"
-                        return rest
-
-                # For normal sentences, try to extract a meaningful phrase first
-                phrase = self._extract_meaningful_phrase(selected_sentence)
-                if phrase:
-                    return phrase
-
-                # If no good phrase found, use the sentence as-is (it works fine for search)
-                return selected_sentence
-
-        # Fallback: extract meaningful word phrase
-        phrase = self._extract_meaningful_phrase(target_para)
-        if phrase:
-            return phrase
-
-        # Last resort: use a clean slice
+        # Fallback: clean slice of paragraph
         clean_para = re.sub(r'\s+', ' ', target_para).strip()
         return clean_para[:120]
 
-    def _extract_meaningful_phrase(self, text: str) -> Optional[str]:
-        """
-        Extract a meaningful phrase from text (avoid complete sentence questions).
-
-        Tries to find:
-        - Consecutive nouns/terms (5-12 words)
-        - Removes stop words from start/end
-        """
-        stop_words = {
-            'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were',
-            'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
-            'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall',
-            'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in', 'for',
-            'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during',
-            'before', 'after', 'above', 'below', 'between', 'under', 'again',
-            'further', 'then', 'once', 'this', 'that', 'these', 'those', 'it',
-            'its', 'he', 'she', 'they', 'them', 'we', 'us', 'i', 'me', 'my',
-            'your', 'his', 'her', 'their', 'our', 'what', 'which', 'who', 'whom',
-            'whose', 'where', 'when', 'why', 'how', 'all', 'each', 'few', 'more',
-            'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own',
-            'same', 'so', 'than', 'too', 'very', 'just', 'also', 'now', 'here',
-            'there', 'about', 'because', 'while', 'until', 'unless', 'although',
-            'though', 'if', 'since', 'so', 'therefore', 'thus', 'hence', 'however'
-        }
-
-        words = re.split(r'\s+', text.strip())
-        if len(words) < 5:
-            return None
-
-        # Clean words (remove punctuation)
-        cleaned_words = []
-        for w in words:
-            clean = re.sub(r'[^\w\-\']', '', w)
-            if clean:
-                cleaned_words.append(clean)
-
-        if len(cleaned_words) < 5:
-            return None
-
-        # Try to find a good slice of 5-10 words
-        # Start from the middle
-        start_idx = max(0, len(cleaned_words) // 3)
-
-        # Try different window sizes
-        for window_size in [10, 8, 6, 5]:
-            end_idx = min(len(cleaned_words), start_idx + window_size)
-            candidate = cleaned_words[start_idx:end_idx]
-
-            if len(candidate) >= 5:
-                # Trim stop words from beginning
-                while candidate and candidate[0].lower() in stop_words:
-                    candidate.pop(0)
-                # Trim stop words from end
-                while candidate and candidate[-1].lower() in stop_words:
-                    candidate.pop()
-
-                if len(candidate) >= 4:
-                    phrase = ' '.join(candidate)
-                    if 20 <= len(phrase) <= 120:
-                        return phrase
-
-        # If nothing else works, just use the middle 6-8 words
-        start_idx = max(0, (len(cleaned_words) - 7) // 2)
-        end_idx = min(len(cleaned_words), start_idx + 7)
-        phrase = ' '.join(cleaned_words[start_idx:end_idx])
-        return phrase
-
-    def _fix_hyphenated_breaks(self, text: str) -> str:
-        """
-        Fix hyphenated word breaks from PDF/text extraction.
-
-        Examples:
-            "limi-\ntations" → "limitations"
-            "exam-\nple" → "example"
-        """
-        # Pattern: word- followed by newline and then more word characters
-        # Handle both "-\n" and "-\r\n" and also "-\t" etc.
+    @staticmethod
+    def _fix_hyphenated_breaks(text: str) -> str:
+        """Fix hyphenated word breaks from PDF/text extraction."""
         text = re.sub(r'(\w+)-[\r\n\t]+(\w+)', r'\1\2', text)
-        # Also handle cases with a space after hyphen: "limi- \ntations"
         text = re.sub(r'(\w+)-[\r\n\t ]+(\w+)', r'\1\2', text)
-        # Normalize multiple spaces
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
 
@@ -258,7 +295,7 @@ class DataGenerator:
         queries: List[EvalQuery],
         batch_size: int = 4,
     ) -> List[EvalQuery]:
-        """Precompute golden_embedding and cache in EvalQuery."""
+        """Precompute golden_embedding for queries."""
         if not self.embedding_provider:
             logger.warning("No embedding provider, skipping precompute")
             return queries
@@ -266,10 +303,10 @@ class DataGenerator:
         all_embeddings = []
         contents = [q.golden_context for q in queries]
 
-        # Process in small batches to avoid OOM
         for i in range(0, len(contents), batch_size):
             batch = contents[i:i + batch_size]
-            logger.info("Precomputing embeddings batch {}/{}", i // batch_size + 1, (len(contents) + batch_size - 1) // batch_size)
+            logger.info("Precomputing embeddings batch {}/{}",
+                       i // batch_size + 1, (len(contents) + batch_size - 1) // batch_size)
             batch_embeddings = await self.embedding_provider.embed_batch(batch)
             all_embeddings.extend(batch_embeddings)
 

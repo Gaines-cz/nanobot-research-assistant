@@ -1,9 +1,4 @@
-"""RAG Evaluation - Report Generator.
-
-This module provides functionality to generate beautiful ASCII reports
-for RAG evaluation results, including ablation study comparisons and
-failure case analysis.
-"""
+"""RAG Evaluation - Report Generator."""
 
 from dataclasses import dataclass
 from enum import Enum
@@ -15,13 +10,13 @@ from nanobot.rag.evaluation.base import EvalQuery, EvalResult, EvalSummary
 
 class FailureCategory(Enum):
     """Categories for classifying retrieval failures."""
-    CHUNKING_ISSUE = "chunking_issue"           # Golden content split across chunks
-    RETRIEVAL_BM25_FAIL = "bm25_fail"           # BM25 didn't retrieve the chunk
-    RETRIEVAL_VECTOR_FAIL = "vector_fail"        # Vector search didn't retrieve the chunk
-    RERANKING_FAIL = "reranking_fail"            # Chunk was reranked out of top-K
-    THRESHOLD_FILTERED = "threshold_filtered"    # Chunk was filtered by threshold
-    SEMANTIC_MISMATCH = "semantic_mismatch"      # Semantic similarity too low
-    UNKNOWN = "unknown"                           # Could not determine
+    CHUNKING_ISSUE = "chunking_issue"
+    RETRIEVAL_BM25_FAIL = "bm25_fail"
+    RETRIEVAL_VECTOR_FAIL = "vector_fail"
+    RERANKING_FAIL = "reranking_fail"
+    THRESHOLD_FILTERED = "threshold_filtered"
+    SEMANTIC_MISMATCH = "semantic_mismatch"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -40,22 +35,13 @@ class FailureAnalyzer:
         result: EvalResult,
         query: EvalQuery,
     ) -> FailureAnalysis:
-        """Classify the reason for a retrieval failure.
-
-        Args:
-            result: The evaluation result for the query
-            query: The original evaluation query
-
-        Returns:
-            FailureAnalysis with category and description
-        """
+        """Classify the reason for a retrieval failure."""
         if result.hit:
             return FailureAnalysis(
                 category=FailureCategory.UNKNOWN,
                 description="Query succeeded, no failure to analyze"
             )
 
-        # Analyze based on failure_reason from ResultJudge
         failure_reason = result.failure_reason or ""
 
         if "no_results" in failure_reason:
@@ -88,7 +74,6 @@ class FailureAnalyzer:
                 suggested_fix="Lower the relevant threshold in config"
             )
 
-        # Default: unknown
         return FailureAnalysis(
             category=FailureCategory.UNKNOWN,
             description=f"Unclassified failure: {failure_reason}",
@@ -99,18 +84,10 @@ class FailureAnalyzer:
         self,
         failures: List[FailureAnalysis],
     ) -> List[str]:
-        """Generate improvement suggestions based on failure distribution.
-
-        Args:
-            failures: List of failure analyses
-
-        Returns:
-            List of suggestion strings
-        """
+        """Generate improvement suggestions based on failure distribution."""
         if not failures:
             return ["No failures to analyze!"]
 
-        # Count failure categories
         category_counts: Dict[FailureCategory, int] = {}
         for failure in failures:
             category_counts[failure.category] = category_counts.get(failure.category, 0) + 1
@@ -118,41 +95,34 @@ class FailureAnalyzer:
         suggestions = []
         total = len(failures)
 
-        # Suggest based on most common failures
         for category, count in sorted(category_counts.items(), key=lambda x: x[1], reverse=True):
             percentage = (count / total) * 100
             if percentage < 5:
-                continue  # Skip rare failures
+                continue
 
             if category == FailureCategory.CHUNKING_ISSUE:
                 suggestions.append(
-                    f"🔧 Chunking issues ({percentage:.1f}%): Consider adjusting chunk size "
-                    f"(current issues affect {count} queries)"
+                    f"Chunking issues ({percentage:.1f}%): Consider adjusting chunk size"
                 )
             elif category == FailureCategory.RETRIEVAL_BM25_FAIL:
                 suggestions.append(
-                    f"🔍 BM25 retrieval failures ({percentage:.1f}%): Try lowering bm25_threshold "
-                    f"or increasing recall_bm25_top_k (affects {count} queries)"
+                    f"BM25 retrieval failures ({percentage:.1f}%): Try lowering bm25_threshold"
                 )
             elif category == FailureCategory.RETRIEVAL_VECTOR_FAIL:
                 suggestions.append(
-                    f"🎯 Vector retrieval failures ({percentage:.1f}%): Try lowering vector_threshold "
-                    f"or increasing recall_vector_top_k (affects {count} queries)"
+                    f"Vector retrieval failures ({percentage:.1f}%): Try lowering vector_threshold"
                 )
             elif category == FailureCategory.RERANKING_FAIL:
                 suggestions.append(
-                    f"📊 Reranking failures ({percentage:.1f}%): Check rerank_threshold or consider "
-                    f"a different reranker model (affects {count} queries)"
+                    f"Reranking failures ({percentage:.1f}%): Check rerank_threshold"
                 )
             elif category == FailureCategory.THRESHOLD_FILTERED:
                 suggestions.append(
-                    f"🚫 Threshold filtered ({percentage:.1f}%): Consider relaxing thresholds "
-                    f"(affects {count} queries)"
+                    f"Threshold filtered ({percentage:.1f}%): Consider relaxing thresholds"
                 )
             elif category == FailureCategory.SEMANTIC_MISMATCH:
                 suggestions.append(
-                    f"🧠 Semantic mismatch ({percentage:.1f}%): Consider query expansion or "
-                    f"different embedding model (affects {count} queries)"
+                    f"Semantic mismatch ({percentage:.1f}%): Consider query expansion"
                 )
 
         if not suggestions:
@@ -172,179 +142,75 @@ class ReportGenerator:
         results: Dict[str, EvalSummary],
         ablation_configs: List[AblationConfig],
     ) -> str:
-        """Generate ASCII table comparing ablation study results.
-
-        Args:
-            results: Dictionary mapping config names to EvalSummary
-            ablation_configs: List of ablation configurations used
-
-        Returns:
-            Formatted ASCII table string
-        """
-        # Get baseline for comparison
+        """Generate ASCII table comparing ablation study results."""
         baseline_name = "BM25 Only (Baseline)"
         baseline_summary = results.get(baseline_name)
-        baseline_recall = baseline_summary.recall_at_5 if baseline_summary else None
+        baseline_recall = baseline_summary.recall_at_k if baseline_summary else None
 
-        # Build table header
         lines = []
-        lines.append("┌─────────────────────────┬──────────┬──────────┬─────────────┬─────────┐")
-        lines.append("│ Configuration           │ Recall@5 │ MRR      │ Latency(ms) │ vs Base │")
-        lines.append("├─────────────────────────┼──────────┼──────────┼─────────────┼─────────┤")
+        lines.append("┌─────────────────────────┬──────────┬──────────┬──────────┬─────────────┬─────────┐")
+        lines.append("│ Configuration           │ Recall@K │ MRR      │ NDCG@K   │ Latency(ms) │ vs Base │")
+        lines.append("├─────────────────────────┼──────────┼──────────┼──────────┼─────────────┼─────────┤")
 
-        # Add rows for each config in order
         for config in ablation_configs:
             if config.name not in results:
                 continue
 
             summary = results[config.name]
-            recall = f"{summary.recall_at_5:.4f}"
+            recall = f"{summary.recall_at_k:.4f}"
             mrr = f"{summary.mrr:.4f}"
+            ndcg = f"{summary.ndcg_at_k:.4f}"
             latency = f"{summary.avg_latency_ms:.1f}"
 
-            # Calculate improvement vs baseline
             vs_base = "   --   "
             if baseline_recall and baseline_recall > 0 and config.name != baseline_name:
-                imp_pct = (summary.recall_at_5 - baseline_recall) / baseline_recall * 100
+                imp_pct = (summary.recall_at_k - baseline_recall) / baseline_recall * 100
                 vs_base = f"{imp_pct:+.1f}%".rjust(8)
 
-            # Truncate config name if too long
             name_display = config.name[:23].ljust(23)
 
             lines.append(
-                f"│ {name_display} │ {recall:8} │ {mrr:8} │ {latency:11} │ {vs_base:7} │"
+                f"│ {name_display} │ {recall:8} │ {mrr:8} │ {ndcg:8} │ {latency:11} │ {vs_base:7} │"
             )
 
-        lines.append("└─────────────────────────┴──────────┴──────────┴─────────────┴─────────┘")
-        return "\n".join(lines)
-
-    @staticmethod
-    def generate_failure_analysis(
-        summary: EvalSummary,
-        queries: List[EvalQuery],
-        max_examples: int = 10,
-    ) -> str:
-        """Generate detailed failure analysis report.
-
-        Args:
-            summary: Evaluation summary with detailed results
-            queries: Original evaluation queries
-            max_examples: Maximum number of failure examples to show
-
-        Returns:
-            Formatted failure analysis string
-        """
-        lines = []
-        lines.append("\n" + "=" * 60)
-        lines.append("FAILURE ANALYSIS")
-        lines.append("=" * 60)
-
-        if not summary.details:
-            lines.append("No detailed results available")
-            return "\n".join(lines)
-
-        # Build query map
-        query_map = {q.id: q for q in queries}
-
-        # Separate failures
-        failures = [r for r in summary.details if not r.hit]
-        successes = [r for r in summary.details if r.hit]
-
-        lines.append(f"\nTotal Queries: {len(summary.details)}")
-        lines.append(f"Successes: {len(successes)} ({len(successes)/len(summary.details)*100:.1f}%)")
-        lines.append(f"Failures: {len(failures)} ({len(failures)/len(summary.details)*100:.1f}%)")
-
-        # Difficulty breakdown for failures
-        if failures:
-            lines.append("\n--- Failure by Difficulty ---")
-            diff_counts: Dict[str, int] = {}
-            for f in failures:
-                diff = f.difficulty or "unknown"
-                diff_counts[diff] = diff_counts.get(diff, 0) + 1
-
-            for diff, count in sorted(diff_counts.items()):
-                lines.append(f"  {diff}: {count}")
-
-        # Failure reason breakdown
-        if failures:
-            lines.append("\n--- Failure Reasons ---")
-            reason_counts: Dict[str, int] = {}
-            for f in failures:
-                reason = f.failure_reason or "unknown"
-                reason_counts[reason] = reason_counts.get(reason, 0) + 1
-
-            for reason, count in sorted(reason_counts.items(), key=lambda x: x[1], reverse=True):
-                lines.append(f"  {reason}: {count}")
-
-        # Show example failures
-        if failures:
-            lines.append(f"\n--- Example Failures (first {min(max_examples, len(failures))}) ---")
-            for i, result in enumerate(failures[:max_examples]):
-                query = query_map.get(result.query_id)
-                lines.append(f"\n[{i+1}] Query: {result.query}")
-                if query:
-                    lines.append(f"      Source: {query.source_doc or 'unknown'}")
-                    lines.append(f"      Expected chunk ID: {query.source_chunk_id}")
-                if result.failure_reason:
-                    lines.append(f"      Reason: {result.failure_reason}")
-                if result.found_chunk_ids:
-                    lines.append(f"      Found chunks: {result.found_chunk_ids}")
-
-        lines.append("\n" + "=" * 60)
+        lines.append("└─────────────────────────┴──────────┴──────────┴──────────┴─────────────┴─────────┘")
         return "\n".join(lines)
 
     @staticmethod
     def generate_summary_table(summary: EvalSummary, include_baseline: bool = True) -> str:
-        """Generate a summary table for a single evaluation run.
-
-        Args:
-            summary: Evaluation summary to display
-            include_baseline: Whether to include baseline comparison
-
-        Returns:
-            Formatted ASCII table
-        """
+        """Generate a summary table for a single evaluation run."""
+        k = summary.config.top_k
         lines = []
 
-        # Core metrics
-        lines.append("\n" + "=" * 50)
-        lines.append("EVALUATION SUMMARY")
-        lines.append("=" * 50)
+        lines.append("\n" + "=" * 60)
+        lines.append("RAG Evaluation Results")
+        lines.append("=" * 60)
         lines.append(f"\nDataset: {summary.dataset_name}")
         lines.append(f"Queries: {summary.num_queries}")
         if summary.random_seed is not None:
             lines.append(f"Random Seed: {summary.random_seed}")
 
-        # Table
-        lines.append("\n┌─────────────┬───────────┐")
-        lines.append("│ Metric      │ Value     │")
-        lines.append("├─────────────┼───────────┤")
-        lines.append(f"│ Recall@5    │ {summary.recall_at_5:.4f}    │")
-        lines.append(f"│ MRR         │ {summary.mrr:.4f}    │")
-        lines.append(f"│ Hit Rate@5  │ {summary.hit_rate_at_5:.4f}    │")
-        lines.append(f"│ Avg Latency │ {summary.avg_latency_ms:7.2f}ms │")
-        lines.append("└─────────────┴───────────┘")
+        # Main metrics table
+        lines.append("\n" + "-" * 60)
+        lines.append(f"{'':15} {'RAG Pipeline':>15} {'BM25 Baseline':>15}")
+        lines.append("-" * 60)
+        lines.append(f"{'Recall@' + str(k):15} {summary.recall_at_k:>15.4f} {summary.baseline_recall_at_k or 0:>15.4f}")
+        lines.append(f"{'MRR':15} {summary.mrr:>15.4f} {summary.baseline_mrr or 0:>15.4f}")
+        lines.append(f"{'Hit Rate@' + str(k):15} {summary.hit_rate_at_k:>15.4f} {summary.baseline_ndcg_at_k or 0:>15.4f}")
+        lines.append(f"{'NDCG@' + str(k):15} {summary.ndcg_at_k:>15.4f} {summary.baseline_ndcg_at_k or 0:>15.4f}")
+        lines.append(f"{'Avg Latency (ms)':15} {summary.avg_latency_ms:>15.2f} {'--':>15}")
+        lines.append("-" * 60)
 
-        # Baseline comparison
-        if include_baseline and summary.baseline_recall_at_5 is not None:
-            lines.append("\n--- Baseline Comparison ---")
-            lines.append(f"Baseline Recall@5: {summary.baseline_recall_at_5:.4f}")
-            lines.append(f"Baseline MRR: {summary.baseline_mrr:.4f}")
-            if summary.baseline_recall_at_5 > 0:
-                imp = (summary.recall_at_5 - summary.baseline_recall_at_5) / summary.baseline_recall_at_5 * 100
-                lines.append(f"Improvement: {imp:+.1f}%")
+        # Calculate improvement
+        if include_baseline and summary.baseline_recall_at_k and summary.baseline_recall_at_k > 0:
+            recall_imp = (summary.recall_at_k - summary.baseline_recall_at_k) / summary.baseline_recall_at_k * 100
+            lines.append(f"\nImprovement: Recall {recall_imp:+.1f}%")
 
-        # Difficulty breakdown
-        if summary.difficulty_breakdown:
-            lines.append("\n--- Difficulty Breakdown ---")
-            for diff, data in summary.difficulty_breakdown.items():
-                lines.append(f"  {diff}: {data['hits']}/{data['total']} ({data['recall']:.1%})")
-
-        # Failure breakdown
-        if summary.failure_breakdown:
-            lines.append("\n--- Failure Breakdown ---")
-            for reason, count in summary.failure_breakdown.items():
-                lines.append(f"  {reason}: {count}")
+        # Question type breakdown
+        if summary.question_type_breakdown:
+            lines.append("\n--- By Question Type ---")
+            for qtype, data in summary.question_type_breakdown.items():
+                lines.append(f"  {qtype}: Recall={data['recall']:.4f}, MRR={data['mrr']:.4f} ({data['total']} queries)")
 
         return "\n".join(lines)
 
@@ -356,54 +222,30 @@ class ReportGenerator:
         ablation_configs: Optional[List[AblationConfig]] = None,
         show_failure_analysis: bool = False,
     ) -> str:
-        """Generate a complete report with all sections.
-
-        Args:
-            summary: Main evaluation summary
-            queries: Original evaluation queries
-            ablation_results: Optional ablation study results
-            ablation_configs: Optional ablation configurations
-            show_failure_analysis: Whether to show detailed failure analysis
-
-        Returns:
-            Complete formatted report
-        """
+        """Generate a complete report with all sections."""
         parts = []
 
-        # Main summary
         parts.append(self.generate_summary_table(summary))
 
-        # Ablation table if available
         if ablation_results and ablation_configs:
             parts.append("\n\n" + "=" * 60)
-            parts.append("ABLATION STUDY RESULTS")
+            parts.append("Ablation Study Results")
             parts.append("=" * 60)
             parts.append("\n" + self.generate_ablation_table(ablation_results, ablation_configs))
 
-            # Add descriptions
-            parts.append("\n\n--- Configurations ---")
-            for config in ablation_configs:
-                parts.append(f"\n{config.name}:")
-                parts.append(f"  {config.description}")
-
-        # Failure analysis if requested
-        if show_failure_analysis:
-            parts.append(self.generate_failure_analysis(summary, queries))
-
-            # Improvement suggestions
-            if summary.details:
-                failures = [r for r in summary.details if not r.hit]
-                if failures:
-                    query_map = {q.id: q for q in queries}
-                    analyses = [
-                        self.failure_analyzer.analyze_failure(f, query_map.get(f.query_id, EvalQuery(
-                            id=f.query_id, query=f.query, golden_context=""
-                        )))
-                        for f in failures
-                    ]
-                    suggestions = self.failure_analyzer.generate_improvement_suggestions(analyses)
-                    parts.append("\n--- IMPROVEMENT SUGGESTIONS ---")
-                    for i, suggestion in enumerate(suggestions, 1):
-                        parts.append(f"\n{i}. {suggestion}")
+        if show_failure_analysis and summary.details:
+            failures = [r for r in summary.details if not r.hit]
+            if failures:
+                query_map = {q.id: q for q in queries}
+                analyses = [
+                    self.failure_analyzer.analyze_failure(f, query_map.get(f.query_id, EvalQuery(
+                        id=f.query_id, query=f.query, golden_context=""
+                    )))
+                    for f in failures
+                ]
+                suggestions = self.failure_analyzer.generate_improvement_suggestions(analyses)
+                parts.append("\n--- IMPROVEMENT SUGGESTIONS ---")
+                for i, suggestion in enumerate(suggestions, 1):
+                    parts.append(f"\n{i}. {suggestion}")
 
         return "\n".join(parts)

@@ -1,6 +1,7 @@
 """RAG Evaluation - Metrics calculator."""
 
-from typing import List, Optional
+import math
+from typing import List
 
 from nanobot.rag.evaluation.base import EvalResult
 
@@ -32,7 +33,6 @@ class MetricsCalculator:
             return 0.0
 
         total = 0.0
-
         for r in results:
             if use_baseline:
                 if r.baseline_hit and r.baseline_hit_rank:
@@ -61,57 +61,80 @@ class MetricsCalculator:
         return hits / len(results)
 
     @staticmethod
+    def ndcg_at_k(results: List[EvalResult], k: int = 5, use_baseline: bool = False) -> float:
+        """Calculate NDCG@K (Normalized Discounted Cumulative Gain).
+
+        For binary relevance (hit=1, miss=0):
+        DCG@k = sum(rel_i / log2(i+1)) for i in 1 to k
+        IDCG@k = DCG@k for perfect ranking (all hits at top)
+        NDCG@k = DCG@k / IDCG@k
+        """
+        if not results:
+            return 0.0
+
+        # Build relevance list for this result
+        def calc_dcg(relevances: List[int], k: int) -> float:
+            dcg = 0.0
+            for i, rel in enumerate(relevances[:k]):
+                dcg += rel / math.log2(i + 2)  # i+2 because i is 0-indexed, log2(1)=0
+            return dcg
+
+        total_ndcg = 0.0
+        for r in results:
+            if use_baseline:
+                if r.baseline_hit and r.baseline_hit_rank:
+                    # Relevance: 1 for the hit at its rank, 0 elsewhere
+                    relevances = [1 if i + 1 == r.baseline_hit_rank else 0 for i in range(k)]
+                else:
+                    relevances = [0] * k
+            else:
+                if r.hit and r.hit_rank:
+                    relevances = [1 if i + 1 == r.hit_rank else 0 for i in range(k)]
+                else:
+                    relevances = [0] * k
+
+            dcg = calc_dcg(relevances, k)
+            # IDCG: best possible DCG (hit at position 1)
+            idcg = calc_dcg([1], k)
+            ndcg = dcg / idcg if idcg > 0 else 0.0
+            total_ndcg += ndcg
+
+        return total_ndcg / len(results)
+
+    @staticmethod
     def avg_latency(results: List[EvalResult]) -> float:
-        """Calculate average latency."""
+        """Calculate average latency in ms."""
         if not results:
             return 0.0
         return sum(r.latency_ms for r in results) / len(results)
 
     @staticmethod
-    def difficulty_breakdown(results: List[EvalResult]) -> dict:
-        """Break down metrics by difficulty."""
+    def question_type_breakdown(results: List[EvalResult], queries_map: dict) -> dict:
+        """Break down metrics by question type."""
         if not results:
             return {}
 
         breakdown = {}
         for r in results:
-            if r.difficulty:
-                if r.difficulty not in breakdown:
-                    breakdown[r.difficulty] = {"total": 0, "hits": 0}
-                breakdown[r.difficulty]["total"] += 1
-                if r.hit:
-                    breakdown[r.difficulty]["hits"] += 1
+            query = queries_map.get(r.query_id)
+            if not query or not query.question_type:
+                continue
 
-        # Calculate recall for each difficulty
-        for diff in breakdown:
-            total = breakdown[diff]["total"]
-            hits = breakdown[diff]["hits"]
-            breakdown[diff]["recall"] = hits / total if total > 0 else 0.0
+            qtype = query.question_type
+            if qtype not in breakdown:
+                breakdown[qtype] = {"total": 0, "hits": 0, "mrr_sum": 0.0}
 
-        return breakdown
+            breakdown[qtype]["total"] += 1
+            if r.hit:
+                breakdown[qtype]["hits"] += 1
+            if r.hit and r.hit_rank:
+                breakdown[qtype]["mrr_sum"] += 1.0 / r.hit_rank
 
-    @staticmethod
-    def failure_breakdown(results: List[EvalResult]) -> dict:
-        """Break down by failure reason."""
-        if not results:
-            return {}
-
-        breakdown = {}
-        for r in results:
-            if not r.hit and r.failure_reason:
-                reason = r.failure_reason
-                if reason not in breakdown:
-                    breakdown[reason] = 0
-                breakdown[reason] += 1
+        # Calculate metrics for each type
+        for qtype in breakdown:
+            total = breakdown[qtype]["total"]
+            hits = breakdown[qtype]["hits"]
+            breakdown[qtype]["recall"] = hits / total if total > 0 else 0.0
+            breakdown[qtype]["mrr"] = breakdown[qtype]["mrr_sum"] / total if total > 0 else 0.0
 
         return breakdown
-
-    @staticmethod
-    def compute_relative_improvement(
-        our_metric: float,
-        baseline_metric: float,
-    ) -> Optional[float]:
-        """Calculate relative improvement (%)."""
-        if baseline_metric == 0:
-            return None
-        return (our_metric - baseline_metric) / baseline_metric * 100

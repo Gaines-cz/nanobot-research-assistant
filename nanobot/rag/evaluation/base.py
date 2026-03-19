@@ -1,6 +1,6 @@
 """RAG Evaluation - Base data structures."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 
@@ -8,12 +8,12 @@ from typing import List, Optional
 class EvalQuery:
     """Single test query for RAG evaluation."""
     id: str
-    query: str
-    golden_context: str
+    query: str  # LLM 生成的原始问题
+    golden_context: str  # 对应的 chunk 内容
     source_chunk_id: Optional[int] = None
     source_doc: Optional[str] = None
-    difficulty: Optional[str] = None  # easy/medium/hard
-    tags: Optional[List[str]] = None
+    question_type: Optional[str] = None  # factoid / summary / analytical
+    tags: List[str] = field(default_factory=list)
     golden_embedding: Optional[List[float]] = None
 
 
@@ -24,28 +24,22 @@ class EvalResult:
     query: str
     hit: bool
     hit_rank: Optional[int] = None
-    hit_reason: Optional[str] = None  # "id_match" / "strong_semantic" / "weak_semantic"
+    hit_reason: Optional[str] = None
     failure_reason: Optional[str] = None
     similarity_scores: Optional[List[float]] = None
-    best_similarity: Optional[float] = None  # Best similarity score among results
+    best_similarity: Optional[float] = None
     found_chunk_ids: Optional[List[int]] = None
     latency_ms: float = 0.0
-    difficulty: Optional[str] = None
     # Baseline comparison
     baseline_hit: Optional[bool] = None
     baseline_hit_rank: Optional[int] = None
-    # Added for deep analysis
-    retrieved_contents: Optional[List[str]] = None  # Retrieved content snippets
-    expected_content: Optional[str] = None          # Expected golden content
-    query_embedding: Optional[List[float]] = None   # Query embedding vector
-    retrieved_embeddings: Optional[List[List[float]]] = None  # Embeddings of retrieved results
+    # For NDCG calculation
+    relevance_scores: Optional[List[float]] = None  # Relevance of each retrieved chunk (0 or 1)
 
 
 @dataclass
 class EvalConfig:
     """Evaluation configuration."""
-    strong_threshold: float = 0.7
-    weak_threshold: float = 0.6
     top_k: int = 5
     random_seed: Optional[int] = 42
 
@@ -57,16 +51,27 @@ class EvalSummary:
     num_queries: int
     config: EvalConfig
     # Core metrics
-    recall_at_5: float
+    recall_at_k: float
     mrr: float
-    hit_rate_at_5: float
+    hit_rate_at_k: float
+    ndcg_at_k: float
     avg_latency_ms: float
     random_seed: Optional[int] = None
     # Baseline comparison metrics
-    baseline_recall_at_5: Optional[float] = None
+    baseline_recall_at_k: Optional[float] = None
     baseline_mrr: Optional[float] = None
-    # Extended metrics
-    difficulty_breakdown: Optional[dict] = None
-    failure_breakdown: Optional[dict] = None
+    baseline_ndcg_at_k: Optional[float] = None
+    # Question type breakdown
+    question_type_breakdown: Optional[dict] = None
     # Detailed results
     details: Optional[List[EvalResult]] = None
+
+
+@dataclass
+class TestDataset:
+    """A complete test dataset."""
+    version: str
+    created_at: str
+    num_queries: int
+    queries: List[EvalQuery]
+    metadata: dict = field(default_factory=dict)
