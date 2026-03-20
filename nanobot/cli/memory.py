@@ -69,7 +69,6 @@ def memory_view(
         "projects": MemoryFile.PROJECTS,
         "papers": MemoryFile.PAPERS,
         "decisions": MemoryFile.DECISIONS,
-        "todos": MemoryFile.TODOS,
         "history": MemoryFile.HISTORY,
     }
 

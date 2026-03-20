@@ -161,7 +161,7 @@ def _create_workspace_templates(workspace: Path):
     memory_dir.mkdir(exist_ok=True)
 
     # Memory files: create templates for all MemoryStore files
-    MEMORY_TEMPLATES = ["PROFILE", "PROJECTS", "PAPERS", "DECISIONS", "TODOS"]
+    MEMORY_TEMPLATES = ["PROFILE", "PROJECTS", "PAPERS", "DECISIONS"]
 
     for template_name in MEMORY_TEMPLATES:
         template = templates_dir / "memory" / f"{template_name}.md.template"
