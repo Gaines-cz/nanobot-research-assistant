@@ -14,7 +14,6 @@ memory/
 ├── PROJECTS.md    # Project knowledge (tech stack, architecture). Semi-stable.
 ├── PAPERS.md      # Paper notes (papers read, key findings). Incremental.
 ├── DECISIONS.md   # Decision records (why A over B). Incremental.
-├── TODOS.md       # Current tasks and next steps. Frequently updated.
 └── HISTORY.md     # Append-only event log. NOT loaded into context.
 ```
 
@@ -22,7 +21,7 @@ memory/
 
 Memory files are loaded selectively based on context:
 
-- **Always loaded**: PROFILE.md, TODOS.md
+- **Always loaded**: PROFILE.md
 - **Keyword-triggered**:
   - `论文/paper/arxiv/研究` → PAPERS.md
   - `项目/project/代码/架构` → PROJECTS.md
@@ -39,7 +38,6 @@ nanobot memory status
 For viewing a specific file:
 ```bash
 nanobot memory view profile
-nanobot memory view todos
 ```
 
 For searching memory content:
@@ -66,7 +64,6 @@ Update memory files directly using `edit_file` or `write_file`:
 - **PROJECTS.md**: Project architecture, tech decisions, progress
 - **PAPERS.md**: Paper summaries, key findings, citations
 - **DECISIONS.md**: Why you chose A over B, trade-offs considered
-- **TODOS.md**: Current tasks, next steps, blockers
 
 ## Auto-consolidation
 
