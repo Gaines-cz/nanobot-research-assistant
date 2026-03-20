@@ -130,7 +130,6 @@ Your workspace is at: {workspace_path}
   - PROJECTS.md: Project knowledge (tech stack, architecture)
   - PAPERS.md: Paper notes and research findings
   - DECISIONS.md: Decision records (why A over B)
-  - TODOS.md: Current tasks and next steps
   - HISTORY.md: Append-only event log (grep-searchable)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
