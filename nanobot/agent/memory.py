@@ -63,7 +63,7 @@ _SAVE_MEMORY_TOOL = [
                             "properties": {
                                 "file": {
                                     "type": "string",
-                                    "enum": ["profile", "projects", "papers", "decisions", "todos"],
+                                    "enum": ["profile", "projects", "papers", "decisions", ],
                                     "description": "Target memory file.",
                                 },
                                 "action": {
@@ -101,7 +101,7 @@ IMPORTANT: These files are for USER-related content only. DO NOT store AI assist
 - **projects**: Project knowledge - tech stack, architecture, progress. Semi-stable.
 - **papers**: Paper notes - papers read, key findings. Incremental, append new entries.
 - **decisions**: Decision records - why A over B. Incremental.
-- **todos**: Todo list. Frequently updated, use replace action.
+# - **todos**: Todo list. Frequently updated, use replace action.
 
 ## Actions
 
@@ -121,7 +121,6 @@ class MemoryStore:
         "projects": MemoryFile.PROJECTS,
         "papers": MemoryFile.PAPERS,
         "decisions": MemoryFile.DECISIONS,
-        "todos": MemoryFile.TODOS,
     }
 
     MAX_MEMORY_FILE_LENGTH = 3000  # 单个 memory 文件最大长度
@@ -516,7 +515,7 @@ class MemoryStore:
         """
         Get memory context for system prompt.
 
-        Only PROFILE and TODOS are loaded by default. Other memory files
+        Only PROFILE is loaded by default. Other memory files
         (PAPERS, PROJECTS, DECISIONS) are NOT loaded into the system prompt -
         the LLM should use the read_file tool to access them when needed.
         """
@@ -545,12 +544,12 @@ class MemoryStore:
             parts.append(f"## Profile\n{profile_truncated}")
             loaded_files.append(f"profile={len(profile_truncated)}")
 
-        # Always load todos - current tasks
-        todos = self.read_file(MemoryFile.TODOS)
-        if todos:
-            todos_truncated = truncate_content(todos, max_file_length)
-            parts.append(f"## Current Tasks\n{todos_truncated}")
-            loaded_files.append(f"todos={len(todos_truncated)}")
+#        # Always load todos - current tasks
+#        todos = self.read_file(MemoryFile.TODOS)
+#        if todos:
+#            todos_truncated = truncate_content(todos, max_file_length)
+#            parts.append(f"## Current Tasks\n{todos_truncated}")
+#            loaded_files.append(f"todos={len(todos_truncated)}")
 
         # NOTE: PAPERS, PROJECTS, DECISIONS are NOT loaded here!
         # The LLM should use read_file tool to access them when needed.
