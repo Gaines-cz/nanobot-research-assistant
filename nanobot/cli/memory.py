@@ -111,3 +111,92 @@ def memory_view(
             console.print()
 
 
+@memory_app.command("purge")
+def memory_purge(
+    type: str = typer.Option(None, "--type", "-t", help="Memory type to purge (history/knowledge/decisions/projects)"),
+    ratio: float = typer.Option(5.0, "--ratio", "-r", help="Purge ratio 1-5%"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview only, no actual deletion"),
+):
+    """Purge low-frequency memories (LFU-based)."""
+    from nanobot.agent.memory import MemoryStore, MemoryType
+    from nanobot.config.loader import load_config
+    from datetime import datetime
+
+    config = load_config()
+    workspace = config.workspace_path
+
+    # Validate ratio
+    if ratio < 1 or ratio > 5:
+        console.print("[red]Ratio must be between 1 and 5[/red]")
+        raise typer.Exit(1)
+
+    # Map type string to MemoryType enum
+    type_map = {
+        "history": MemoryType.HISTORY,
+        "knowledge": MemoryType.KNOWLEDGE,
+        "decisions": MemoryType.DECISIONS,
+        "projects": MemoryType.PROJECTS,
+    }
+
+    memory_type = None
+    if type:
+        type_lower = type.lower()
+        if type_lower not in type_map:
+            console.print(f"[red]Unknown memory type: {type}[/red]")
+            console.print(f"Available: {', '.join(type_map.keys())}")
+            raise typer.Exit(1)
+        memory_type = type_map[type_lower]
+
+    with MemoryStore(workspace) as memory_store:
+        # Get candidates
+        candidates = memory_store.purge_candidates(memory_type, ratio)
+
+        if not candidates:
+            console.print("[yellow]No memories to purge[/yellow]")
+            raise typer.Exit(0)
+
+        # Build preview table
+        table = Table(title="Memory Purge Candidates")
+        table.add_column("Type", style="cyan")
+        table.add_column("ID", justify="right")
+        table.add_column("Read Times", justify="right")
+        table.add_column("Last Read", style="dim")
+        table.add_column("Detail", style="dim")
+
+        total_candidates = 0
+        for mtype, items in candidates.items():
+            for item in items:
+                last_read = datetime.fromtimestamp(item["last_read_time"]).strftime("%Y-%m-%d")
+                detail_preview = item["detail"][:50] + "..." if len(item["detail"]) > 50 else item["detail"]
+                table.add_row(
+                    mtype,
+                    str(item["id"]),
+                    str(item["read_times"]),
+                    last_read,
+                    detail_preview,
+                )
+                total_candidates += 1
+
+        console.print(f"\n[bold]Purge Ratio: {ratio}%[/bold]")
+        console.print(f"[bold]Total Candidates: {total_candidates}[/bold]\n")
+        console.print(table)
+
+        if dry_run:
+            console.print("\n[yellow]--dry-run mode, no memories were deleted[/yellow]")
+            raise typer.Exit(0)
+
+        # Confirm before purge
+        confirm = typer.confirm("\nProceed with purge?")
+        if not confirm:
+            console.print("[yellow]Aborted[/yellow]")
+            raise typer.Exit(0)
+
+        # Execute purge
+        purged = memory_store.purge(memory_type, ratio)
+
+        if not purged:
+            console.print("[yellow]No memories were purged[/yellow]")
+        else:
+            for mtype, count in purged.items():
+                console.print(f"[green]Purged {count} {mtype} memories[/green]")
+

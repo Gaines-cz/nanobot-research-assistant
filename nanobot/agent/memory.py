@@ -652,6 +652,96 @@ class MemoryStore:
             logger.debug("[MemoryStore] Soft deleted memory: id={}", id)
         return deleted
 
+    def purge_candidates(
+        self,
+        memory_type: Optional[MemoryType] = None,
+        ratio: float = 5.0,
+    ) -> list[dict]:
+        """
+        Get memory candidates for purge (LFU-based).
+
+        Args:
+            memory_type: Optional specific type to purge. If None, returns candidates for all types.
+            ratio: Purge ratio percentage (1-5, default 5)
+
+        Returns:
+            List of memory dicts marked for purge, grouped by type
+        """
+        if ratio < 1:
+            ratio = 1
+        elif ratio > 5:
+            ratio = 5
+
+        conn = self._db._conn
+        results: dict[str, list[dict]] = {}
+
+        types_to_purge = [memory_type] if memory_type else list(MemoryType)
+
+        for mtype in types_to_purge:
+            # Get all non-deleted memories of this type, sorted by LFU
+            # LFU: lower read_times first, then older last_read_time first
+            cursor = conn.execute("""
+                SELECT id, type, detail, at_time, read_times, last_read_time
+                FROM memories
+                WHERE type = ? AND deleted_at IS NULL
+                ORDER BY read_times ASC, last_read_time ASC
+            """, (mtype.value,))
+
+            rows = cursor.fetchall()
+            if not rows:
+                continue
+
+            # Calculate purge count: min(count * ratio%, 5% of total)
+            # "5% of total" means at most 5% of total memories can be purged in one run
+            total = len(rows)
+            purge_count = max(1, int(total * ratio / 100))
+            purge_count = min(purge_count, max(1, int(total * 0.05)))
+
+            candidates = []
+            for row in rows[:purge_count]:
+                candidates.append({
+                    "id": row[0],
+                    "type": row[1],
+                    "detail": row[2],
+                    "at_time": row[3],
+                    "read_times": row[4],
+                    "last_read_time": row[5],
+                })
+
+            results[mtype.value] = candidates
+
+        return results
+
+    def purge(
+        self,
+        memory_type: Optional[MemoryType] = None,
+        ratio: float = 5.0,
+    ) -> dict[str, int]:
+        """
+        Execute purge on memories (LFU-based).
+
+        Args:
+            memory_type: Optional specific type to purge. If None, purges all types.
+            ratio: Purge ratio percentage (1-5, default 5)
+
+        Returns:
+            Dict mapping type to number of purged memories
+        """
+        candidates = self.purge_candidates(memory_type, ratio)
+
+        purged_counts: dict[str, int] = {}
+        for mtype, items in candidates.items():
+            count = 0
+            for item in items:
+                if self._db.hard_delete(item["id"]):
+                    count += 1
+                    logger.debug("[MemoryStore] Purged memory: id={}, type={}", item["id"], mtype)
+            if count > 0:
+                purged_counts[mtype] = count
+                logger.info("[MemoryStore] Purged {} {} memories", count, mtype)
+
+        return purged_counts
+
     async def consolidate(self, session: "Session", provider: "LLMProvider", model: str, **kwargs) -> bool:
         """
         Consolidate memory from session using 2-step flow.
