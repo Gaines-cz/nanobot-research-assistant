@@ -7,10 +7,7 @@
     "mrr": 0.7601666666666668,
     "hit_rate_at_k": 0.93,
     "ndcg_at_k": 0.8027788751564243,
-    "avg_latency_ms": 103.19173336029053,
-    "baseline_recall_at_k": 0.0,
-    "baseline_mrr": 0.0,
-    "baseline_ndcg_at_k": 0.0
+    "avg_latency_ms": 104.45413589477539,
   },
   "question_type_breakdown": {
     "factoid": {
