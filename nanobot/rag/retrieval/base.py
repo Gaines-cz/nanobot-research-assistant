@@ -60,7 +60,7 @@ class BaseRetriever(ABC):
         )
 
         # Initialize query expander
-        self._query_expander = QueryExpander(enabled=self.config.enable_query_expand)
+        self._query_expander = QueryExpander(config=self.config)
 
     @staticmethod
     def _sanitize_fts_query(query: str) -> str:

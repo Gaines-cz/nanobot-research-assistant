@@ -87,21 +87,22 @@ class BM25Retriever(Retriever):
                 seen.add(key)
                 merged.append(r)
 
-        # Add neighbor chunks (prev/next) for better recall
-        if merged:
-            neighbor_start = time.perf_counter()
-            neighbor_chunks = self._fetch_neighbor_chunks(merged)
-            neighbor_elapsed = (time.perf_counter() - neighbor_start) * 1000
-            logger.debug("[RAG PERF] BM25 neighbor fetch: {} chunks, elapsed={:.1f}ms",
-                         len(neighbor_chunks), neighbor_elapsed)
-            for r in neighbor_chunks:
-                key = f"{r.path}:{r.chunk_index}"
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(r)
+        # Neighbor chunk expansion is disabled to avoid position-score mismatch in percentile fusion
+        # If context is needed, use Step2 context_expansion instead
+        # if merged:
+        #     neighbor_start = time.perf_counter()
+        #     neighbor_chunks = self._fetch_neighbor_chunks(merged)
+        #     neighbor_elapsed = (time.perf_counter() - neighbor_start) * 1000
+        #     logger.debug("[RAG PERF] BM25 neighbor fetch: {} chunks, elapsed={:.1f}ms",
+        #                  len(neighbor_chunks), neighbor_elapsed)
+        #     for r in neighbor_chunks:
+        #         key = f"{r.path}:{r.chunk_index}"
+        #         if key not in seen:
+        #             seen.add(key)
+        #             merged.append(r)
 
         merge_elapsed = (time.perf_counter() - merge_start) * 1000
-        logger.debug("[RAG PERF] BM25 merge+neighbor: elapsed={:.1f}ms", merge_elapsed)
+        logger.debug("[RAG PERF] BM25 merge: elapsed={:.1f}ms", merge_elapsed)
 
         # Truncate to top_k
         final_results = merged[:top_k]

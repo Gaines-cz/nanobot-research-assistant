@@ -12,6 +12,7 @@ from typing import Any, Optional
 import torch
 from loguru import logger
 
+from nanobot.config.schema import RAGConfig
 from nanobot.utils.torch import get_optimal_device
 
 
@@ -158,7 +159,12 @@ class SemanticDeduplicator:
     Removes chunks with cosine similarity >= threshold (default matches RAGDefaults.DEDUP_THRESHOLD).
     """
 
-    def __init__(self, similarity_threshold: float = 0.7):
+    def __init__(self, similarity_threshold: float = 0.7, config: Optional[RAGConfig] = None):
+        # Backward compatibility: if config not provided, create one with the threshold
+        if config is None:
+            self.config = RAGConfig(dedup_threshold=similarity_threshold)
+        else:
+            self.config = config
         self.similarity_threshold = similarity_threshold
 
     def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
@@ -192,6 +198,9 @@ class SemanticDeduplicator:
             # If any embedding is missing, return all indices (skip deduplication)
             return list(range(len(chunks)))
 
+        # Use threshold from config if available
+        threshold = self.config.dedup_threshold if self.config else self.similarity_threshold
+
         dedup_start = time.perf_counter()
         keep_indices: list[int] = []
 
@@ -201,7 +210,7 @@ class SemanticDeduplicator:
             for j in keep_indices:
                 # We already verified embeddings are not None above
                 sim = self._cosine_similarity(embeddings[i], embeddings[j])  # type: ignore
-                if sim >= self.similarity_threshold:
+                if sim >= threshold:
                     too_similar = True
                     break
 
@@ -231,17 +240,29 @@ class RerankService:
         self,
         reranker: Optional[CrossEncoderReranker] = None,
         deduplicator: Optional[SemanticDeduplicator] = None,
-        rerank_threshold: float = 0.5,
-        dedup_threshold: float = 0.7,
-        rerank_top_k: int = 20,
-        enable_rerank: bool = True,
+        config: Optional[RAGConfig] = None,
+        # Backward compatibility parameters
+        rerank_threshold: Optional[float] = None,
+        dedup_threshold: Optional[float] = None,
+        rerank_top_k: Optional[int] = None,
+        enable_rerank: Optional[bool] = None,
     ):
-        self.reranker = reranker or CrossEncoderReranker()
-        self.deduplicator = deduplicator or SemanticDeduplicator(dedup_threshold)
-        self.rerank_threshold = rerank_threshold
-        self.dedup_threshold = dedup_threshold
-        self.rerank_top_k = rerank_top_k
-        self.enable_rerank = enable_rerank
+        # Backward compatibility: if old parameters are provided, create config from them
+        if config is None and (rerank_threshold is not None or dedup_threshold is not None or
+                                 rerank_top_k is not None or enable_rerank is not None):
+            config = RAGConfig()
+            if rerank_threshold is not None:
+                config.rerank_threshold = rerank_threshold
+            if dedup_threshold is not None:
+                config.dedup_threshold = dedup_threshold
+            if rerank_top_k is not None:
+                config.rerank_top_k = rerank_top_k
+            if enable_rerank is not None:
+                config.enable_rerank = enable_rerank
+
+        self.config = config or RAGConfig()
+        self.reranker = reranker or CrossEncoderReranker(self.config.rerank_model)
+        self.deduplicator = deduplicator or SemanticDeduplicator(self.config.dedup_threshold, self.config)
 
     async def rerank_and_dedup(
         self,
@@ -269,14 +290,14 @@ class RerankService:
 
         # Step 1: Rerank (only top-rerank_top_k for M4 optimization)
         reranked_indices: list[tuple[int, float]] = []
-        if self.enable_rerank and len(candidates) > 0:
+        if self.config.enable_rerank and len(candidates) > 0:
             # Take top candidates to rerank (already sorted by score from merge step)
             # 同时保存原始索引: (original_idx, text)
             # 先 enumerate 再切片，确保保存的是原始索引
             rerank_candidates_with_idx = [
                 (i, text)
                 for i, text in enumerate(candidate_texts)
-            ][:self.rerank_top_k]
+            ][:self.config.rerank_top_k]
             rerank_candidates = [text for _, text in rerank_candidates_with_idx]
             rerank_results = await self.reranker.rerank(query, rerank_candidates)
 
@@ -296,7 +317,7 @@ class RerankService:
             (idx, meta, score)
             for idx, score in reranked_indices
             for meta in [candidate_metadatas[idx]]
-            if score >= self.rerank_threshold
+            if score >= self.config.rerank_threshold
         ]
 
         # If everything filtered out, keep top 3 without threshold

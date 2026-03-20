@@ -1,7 +1,9 @@
 """Query preprocessing for RAG."""
 
 import re
-from typing import Set
+from typing import Optional, Set
+
+from nanobot.config.schema import RAGConfig
 
 # Common research term abbreviations
 QUERY_ABBREVIATIONS: dict[str, tuple[str, ...]] = {
@@ -117,8 +119,12 @@ def expand_query(query: str) -> str:
 class QueryExpander:
     """Query expander with config toggle."""
 
-    def __init__(self, enabled: bool = True):
-        self.enabled = enabled
+    def __init__(self, config: Optional[RAGConfig] = None, enabled: Optional[bool] = None):
+        # Backward compatibility: accept enabled parameter
+        if enabled is not None and config is None:
+            self.config = RAGConfig(enable_query_expand=enabled)
+        else:
+            self.config = config or RAGConfig()
 
     def expand(self, query: str) -> str:
         """
@@ -130,6 +136,6 @@ class QueryExpander:
         Returns:
             Expanded query or original query
         """
-        if not self.enabled:
+        if not self.config.enable_query_expand:
             return query
         return expand_query(query)

@@ -63,15 +63,11 @@ class AdvancedSearchPipeline(AdvancedRetriever):
         self._hybrid_retriever = HybridRetriever(db_connection, embedding_provider, config)
         self._context_expander = ContextExpander(db_connection, config)
 
-        # Initialize rerank service
+        # Initialize rerank service (always create, checks config at runtime)
         self._rerank_service: Optional[RerankService] = None
-        if self.config.enable_rerank and embedding_provider is not None:
+        if embedding_provider is not None:
             self._rerank_service = RerankService(
-                reranker=CrossEncoderReranker(self.config.rerank_model),
-                rerank_threshold=self.config.rerank_threshold,
-                dedup_threshold=self.config.dedup_threshold,
-                rerank_top_k=self.config.rerank_top_k,
-                enable_rerank=self.config.enable_rerank,
+                config=self.config
             )
 
     async def search(self, query: str, top_k: int = 5) -> List[SearchResult]:
@@ -134,9 +130,9 @@ class AdvancedSearchPipeline(AdvancedRetriever):
 
         # Log search entry
         logger.info("[RAG] search_advanced called with query: {}", query)
-        logger.info("[RAG] Config - bm25_threshold: {}, vector_threshold: {}, top_k: {}, rrf_k: {}",
+        logger.info("[RAG] Config - bm25_threshold: {}, vector_threshold: {}, top_k: {}, vector_weight: {}, bm25_weight: {}",
                     self.config.bm25_threshold, self.config.vector_threshold,
-                    self.config.top_k, self.config.rrf_k)
+                    self.config.top_k, self.config.vector_weight, self.config.bm25_weight)
 
         # Track overall search performance
         overall_start = time.perf_counter()
@@ -298,27 +294,41 @@ class AdvancedSearchPipeline(AdvancedRetriever):
             logger.info("[RAG] After relaxed filtering: vector={}, fulltext={}",
                         len(filtered_vector), len(filtered_ft))
 
-            logger.info("[RAG] Step1 StagedFusion starting - filtered_ft={}, filtered_vector={}",
+            logger.info("[RAG] Step1 percentile-weighted fusion starting - filtered_ft={}, filtered_vector={}",
                         len(filtered_ft), len(filtered_vector))
 
-            # Stage 1: BM25 first (all of filtered_ft)
-            seen = set()
-            merged = []
-            for r in filtered_ft:
-                key = f"{r.path}:{r.chunk_index}"
-                seen.add(key)
-                merged.append(r)
-
-            # Stage 2: Add vector results not in BM25
+            # Percentile-weighted fusion
             fusion_start = time.perf_counter()
-            for r in filtered_vector:
-                key = f"{r.path}:{r.chunk_index}"
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(r)
+            VECTOR_WEIGHT = self.config.vector_weight
+            BM25_WEIGHT = self.config.bm25_weight
 
-            # Take recall_stage1_top_k
-            final_results = merged[:self.config.recall_stage1_top_k]
+            n_bm25 = len(filtered_ft)
+            n_vector = len(filtered_vector)
+            weighted_scores: dict[str, tuple[SearchResult, float]] = {}
+
+            # BM25 contributes (percentile = (n - rank + 1) / n)
+            for rank, r in enumerate(filtered_ft, start=1):
+                key = f"{r.path}:{r.chunk_index}"
+                bm25_percentile = (n_bm25 - rank + 1) / n_bm25 if n_bm25 > 0 else 0
+                if key not in weighted_scores:
+                    weighted_scores[key] = (r, BM25_WEIGHT * bm25_percentile)
+                else:
+                    weighted_scores[key] = (weighted_scores[key][0],
+                                              weighted_scores[key][1] + BM25_WEIGHT * bm25_percentile)
+
+            # Vector contributes (percentile = (n - rank + 1) / n)
+            for rank, r in enumerate(filtered_vector, start=1):
+                key = f"{r.path}:{r.chunk_index}"
+                vector_percentile = (n_vector - rank + 1) / n_vector if n_vector > 0 else 0
+                if key not in weighted_scores:
+                    weighted_scores[key] = (r, VECTOR_WEIGHT * vector_percentile)
+                else:
+                    weighted_scores[key] = (weighted_scores[key][0],
+                                              weighted_scores[key][1] + VECTOR_WEIGHT * vector_percentile)
+
+            # Sort by weighted score descending and take top-k
+            sorted_results = sorted(weighted_scores.values(), key=lambda x: x[1], reverse=True)
+            final_results = [r for r, _ in sorted_results[:self.config.recall_stage1_top_k]]
             fusion_elapsed = (time.perf_counter() - fusion_start) * 1000
             final_sources = [r.source for r in final_results]
             final_scores = [f"{r.score:.4f}" for r in final_results]
@@ -555,7 +565,7 @@ class AdvancedSearchPipeline(AdvancedRetriever):
         # Add configuration parameters that affect search results
         key_bytes += f":bm25t={self.config.bm25_threshold}".encode("utf-8")
         key_bytes += f":vectort={self.config.vector_threshold}".encode("utf-8")
-        key_bytes += f":rrfk={self.config.rrf_k}".encode("utf-8")
+        key_bytes += f":vw={self.config.vector_weight}:bw={self.config.bm25_weight}".encode("utf-8")
         key_bytes += f":enable_bm25={self.config.enable_bm25}".encode("utf-8")
         key_bytes += f":enable_vector={self.config.enable_vector}".encode("utf-8")
         key_bytes += f":rerank={self.config.enable_rerank}".encode("utf-8")

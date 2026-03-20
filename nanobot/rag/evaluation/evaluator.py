@@ -193,7 +193,10 @@ class AblationStudy:
         self.doc_store = doc_store
         self.embedding_provider = embedding_provider
         self.eval_config = eval_config or EvalConfig()
-        self.rag_config = rag_config
+        # IMPORTANT: We use doc_store.config directly, not the rag_config parameter!
+        # This ensures that config changes apply to all components in doc_store.
+        # The rag_config parameter is kept for backward compatibility.
+        self.rag_config = self.doc_store.config
         self.k = self.eval_config.top_k
         self.metrics = MetricsCalculator()
 
@@ -220,23 +223,24 @@ class AblationStudy:
         results: Dict[str, EvalSummary] = {}
 
         # Store original config
-        original_rag_config = None
-        if self.rag_config:
-            original_rag_config = {
-                'enable_bm25': self.rag_config.enable_bm25,
-                'enable_vector': self.rag_config.enable_vector,
-                'enable_query_expand': self.rag_config.enable_query_expand,
-                'enable_context_expansion': self.rag_config.enable_context_expansion,
-                'enable_document_level': self.rag_config.enable_document_level,
-                'enable_rerank': self.rag_config.enable_rerank,
-            }
+        original_rag_config = {
+            'enable_bm25': self.rag_config.enable_bm25,
+            'enable_vector': self.rag_config.enable_vector,
+            'enable_query_expand': self.rag_config.enable_query_expand,
+            'enable_context_expansion': self.rag_config.enable_context_expansion,
+            'enable_document_level': self.rag_config.enable_document_level,
+            'enable_rerank': self.rag_config.enable_rerank,
+        }
 
         for config in ablation_configs:
             logger.info("Running ablation: {}", config.name)
 
-            # Apply ablation config
-            if self.rag_config and hasattr(config, 'apply_to_rag_config'):
+            # Apply ablation config directly to doc_store.config
+            if hasattr(config, 'apply_to_rag_config'):
                 config.apply_to_rag_config(self.rag_config)
+
+            # Clear cache before running each ablation
+            self.doc_store.clear_cache()
 
             # Evaluate with this config
             evaluator = RAGEvaluator(
@@ -250,12 +254,11 @@ class AblationStudy:
             results[config.name] = summary
 
         # Restore original config
-        if self.rag_config and original_rag_config:
-            self.rag_config.enable_bm25 = original_rag_config['enable_bm25']
-            self.rag_config.enable_vector = original_rag_config['enable_vector']
-            self.rag_config.enable_query_expand = original_rag_config['enable_query_expand']
-            self.rag_config.enable_context_expansion = original_rag_config['enable_context_expansion']
-            self.rag_config.enable_document_level = original_rag_config['enable_document_level']
-            self.rag_config.enable_rerank = original_rag_config['enable_rerank']
+        self.rag_config.enable_bm25 = original_rag_config['enable_bm25']
+        self.rag_config.enable_vector = original_rag_config['enable_vector']
+        self.rag_config.enable_query_expand = original_rag_config['enable_query_expand']
+        self.rag_config.enable_context_expansion = original_rag_config['enable_context_expansion']
+        self.rag_config.enable_document_level = original_rag_config['enable_document_level']
+        self.rag_config.enable_rerank = original_rag_config['enable_rerank']
 
         return results

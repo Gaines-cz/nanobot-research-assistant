@@ -439,15 +439,25 @@ def rag_eval(
         original_cache_setting = rag_config.enable_search_cache
         rag_config.enable_search_cache = False
 
-        # Precompute embeddings for queries
+        # Precompute embeddings for queries (only if not already present)
         queries = test_dataset.queries
 
-        console.print("Precomputing embeddings...")
-        for i in range(0, len(queries), 10):
-            batch = queries[i:i + 10]
-            batch_embeddings = await embedding_provider.embed_batch([q.golden_context for q in batch])
-            for q, emb in zip(batch, batch_embeddings):
-                q.golden_embedding = emb
+        # Check if we need to compute any embeddings
+        need_embeddings = any(q.golden_embedding is None for q in queries)
+
+        if need_embeddings:
+            console.print("Precomputing embeddings...")
+            for i in range(0, len(queries), 10):
+                batch = queries[i:i + 10]
+                # Only compute for queries that don't have embeddings
+                needs_calc = [(idx, q) for idx, q in enumerate(batch) if q.golden_embedding is None]
+                if needs_calc:
+                    idxs, texts = zip(*[(idx, q.golden_context) for idx, q in needs_calc])
+                    batch_embeddings = await embedding_provider.embed_batch(list(texts))
+                    for (idx, q), emb in zip(needs_calc, batch_embeddings):
+                        batch[idx].golden_embedding = emb
+        else:
+            console.print("Using precomputed embeddings from dataset")
 
         eval_config = EvalConfig(random_seed=42)
 

@@ -1,37 +1,16 @@
 """RAG Evaluation - Baseline retrievers for comparison."""
 
 import re
-from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from loguru import logger
 
 from nanobot.rag.storage.connection import DatabaseConnection
-
-
-@dataclass
-class BaselineChunkInfo:
-    """Minimal chunk info for baseline evaluation."""
-    id: int
-    doc_id: int
-    chunk_index: int
-    content: str
-    embedding: Optional[List[float]] = None
-
-
-@dataclass
-class BaselineDocumentInfo:
-    """Minimal document info for baseline evaluation."""
-    id: int
-    path: str
-    filename: str
-
-
-@dataclass
-class BaselineSearchResult:
-    """Minimal search result for baseline evaluation (compatible with judge)."""
-    document: BaselineDocumentInfo
-    chunk: BaselineChunkInfo
+from nanobot.rag.models import (
+    BaselineSearchResult,
+    ChunkInfo,
+    DocumentInfo,
+)
 
 
 class BaselineRetriever:
@@ -114,7 +93,7 @@ class BaselineRetriever:
                 # Fallback: return recent chunks
                 if self._use_dual_granularity:
                     cursor = db.execute("""
-                        SELECT c.id, c.doc_id, c.chunk_index, c.content, d.path, d.filename
+                        SELECT c.id, c.doc_id, c.chunk_index, c.content, d.path, d.filename, d.file_type, d.file_size
                         FROM chunks c
                         JOIN documents d ON c.doc_id = d.id
                         WHERE c.granularity = 'large'
@@ -123,19 +102,23 @@ class BaselineRetriever:
                     """, (top_k,))
                 else:
                     cursor = db.execute("""
-                        SELECT c.id, c.doc_id, c.chunk_index, c.content, d.path, d.filename
+                        SELECT c.id, c.doc_id, c.chunk_index, c.content, d.path, d.filename, d.file_type, d.file_size
                         FROM chunks c
                         JOIN documents d ON c.doc_id = d.id
                         ORDER BY c.id DESC
                         LIMIT ?
                     """, (top_k,))
                 for i, row in enumerate(cursor):
-                    chunk_id, doc_id, chunk_idx, content, path, filename = row
+                    chunk_id, doc_id, chunk_idx, content, path, filename, file_type, file_size = row
                     embedding = self._load_embedding_for_chunk(chunk_id)
-                    doc_info = BaselineDocumentInfo(id=doc_id, path=path, filename=filename)
-                    chunk_info = BaselineChunkInfo(
+                    doc_info = DocumentInfo(
+                        id=doc_id, path=path, filename=filename,
+                        file_type=file_type or "", file_size=file_size
+                    )
+                    chunk_info = ChunkInfo(
                         id=chunk_id, doc_id=doc_id, chunk_index=chunk_idx,
-                        content=content, embedding=embedding
+                        content=content, score=0.0, source="bm25",
+                        embedding=embedding
                     )
                     results.append(BaselineSearchResult(document=doc_info, chunk=chunk_info))
                 return results
@@ -144,7 +127,7 @@ class BaselineRetriever:
                 cursor = db.execute("""
                     SELECT
                         c.id, c.doc_id, c.chunk_index, c.content,
-                        d.path, d.filename,
+                        d.path, d.filename, d.file_type, d.file_size,
                         bm25(chunks_fts) as score
                     FROM chunks_fts
                     JOIN chunks c ON chunks_fts.rowid = c.id
@@ -158,7 +141,7 @@ class BaselineRetriever:
                 cursor = db.execute("""
                     SELECT
                         c.id, c.doc_id, c.chunk_index, c.content,
-                        d.path, d.filename,
+                        d.path, d.filename, d.file_type, d.file_size,
                         bm25(chunks_fts) as score
                     FROM chunks_fts
                     JOIN chunks c ON chunks_fts.rowid = c.id
@@ -169,12 +152,19 @@ class BaselineRetriever:
                 """, (safe_query, top_k))
 
             for row in cursor:
-                chunk_id, doc_id, chunk_idx, content, path, filename, _ = row
+                chunk_id, doc_id, chunk_idx, content, path, filename, file_type, file_size, bm25_score = row
                 embedding = self._load_embedding_for_chunk(chunk_id)
-                doc_info = BaselineDocumentInfo(id=doc_id, path=path, filename=filename)
-                chunk_info = BaselineChunkInfo(
+                doc_info = DocumentInfo(
+                    id=doc_id, path=path, filename=filename,
+                    file_type=file_type or "", file_size=file_size
+                )
+                # Convert BM25 score to a 0-1 relevance score (lower BM25 = better)
+                # BM25 returns lower scores for better matches, so we invert it
+                relevance_score = 1.0 / (1.0 + bm25_score) if bm25_score >= 0 else 1.0
+                chunk_info = ChunkInfo(
                     id=chunk_id, doc_id=doc_id, chunk_index=chunk_idx,
-                    content=content, embedding=embedding
+                    content=content, score=relevance_score, source="bm25",
+                    embedding=embedding
                 )
                 results.append(BaselineSearchResult(document=doc_info, chunk=chunk_info))
 

@@ -1,12 +1,12 @@
 """RAG Evaluation - Result judge (Hybrid mode)."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from loguru import logger
 
 from nanobot.rag.evaluation.base import EvalQuery
-from nanobot.rag.models import SearchResultWithContext
+from nanobot.rag.models import SearchResultWithContext, BaselineSearchResult
 
 
 class ResultJudge:
@@ -35,7 +35,7 @@ class ResultJudge:
 
     def judge(
         self,
-        results: List[SearchResultWithContext],
+        results: Union[List[SearchResultWithContext], List[BaselineSearchResult]],
         query: EvalQuery,
         golden_embedding: Optional[List[float]] = None,
     ) -> Tuple[bool, Optional[str], Optional[str], Optional[float]]:
@@ -95,7 +95,7 @@ class ResultJudge:
 
     def _judge_by_id(
         self,
-        results: List[SearchResultWithContext],
+        results: Union[List[SearchResultWithContext], List[BaselineSearchResult]],
         query: EvalQuery,
     ) -> Tuple[bool, Optional[str]]:
         """Judge by ID match."""
@@ -110,7 +110,7 @@ class ResultJudge:
 
     def _judge_by_parent_id(
         self,
-        results: List[SearchResultWithContext],
+        results: Union[List[SearchResultWithContext], List[BaselineSearchResult]],
         query: EvalQuery,
     ) -> Tuple[bool, Optional[str]]:
         """
@@ -191,7 +191,7 @@ class ResultJudge:
 
     def _judge_by_semantic_similarity(
         self,
-        results: List[SearchResultWithContext],
+        results: Union[List[SearchResultWithContext], List[BaselineSearchResult]],
         golden_embedding: List[float],
     ) -> Tuple[bool, Optional[str], Optional[float]]:
         """
@@ -222,7 +222,7 @@ class ResultJudge:
 
     def _calculate_best_similarity(
         self,
-        results: List[SearchResultWithContext],
+        results: Union[List[SearchResultWithContext], List[BaselineSearchResult]],
         golden_embedding: List[float],
     ) -> Tuple[Optional[int], Optional[float]]:
         """

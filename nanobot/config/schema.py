@@ -357,8 +357,9 @@ class RAGDefaults:
     TOP_K: int = 5
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
 
-    # Hybrid search - RRF_K=15 balances ranking sensitivity with stability
-    RRF_K: int = 15
+    # Hybrid search - percentile-weighted fusion weights
+    VECTOR_WEIGHT: float = 0.6
+    BM25_WEIGHT: float = 0.4
 
     # Recall stage1 top_k parameters
     RECALL_VECTOR_TOP_K: int = 20
@@ -436,8 +437,9 @@ class RAGConfig(Base):
     embedding_model: str = RAGDefaults.EMBEDDING_MODEL  # Multi-language, good for scientific text
     auto_scan_on_startup: bool = True  # Auto-scan docs on startup
 
-    # Hybrid search weights (RRF parameter)
-    rrf_k: int = RAGDefaults.RRF_K  # RRF parameter k
+    # Hybrid search weights (percentile-weighted fusion)
+    vector_weight: float = RAGDefaults.VECTOR_WEIGHT
+    bm25_weight: float = RAGDefaults.BM25_WEIGHT
 
     # Recall stage1 top_k parameters
     recall_vector_top_k: int = RAGDefaults.RECALL_VECTOR_TOP_K

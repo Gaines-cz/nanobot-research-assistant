@@ -87,7 +87,38 @@ class HybridRetriever(Retriever):
         expand_elapsed = (time.perf_counter() - expand_start) * 1000
         results: List[SearchResult] = []
 
-        if self._db.vector_enabled:
+        logger.info("[HYBRID] Config - enable_bm25: {}, enable_vector: {}",
+                    self.config.enable_bm25, self.config.enable_vector)
+
+        # If both are disabled, return empty
+        if not self.config.enable_bm25 and not self.config.enable_vector:
+            logger.warning("[HYBRID] Both BM25 and Vector search are disabled!")
+            results = []
+        # If only BM25 is enabled
+        elif not self.config.enable_vector:
+            logger.info("[HYBRID] Using only BM25 search results")
+            fallback_start = time.perf_counter()
+            fulltext_results = self._bm25_retriever._fulltext_search(expanded_query, top_k)
+            fallback_elapsed = (time.perf_counter() - fallback_start) * 1000
+            for result in fulltext_results:
+                result.source = "fulltext"
+            results = fulltext_results
+            logger.info("[RAG PERF] Hybrid BM25 only: {} results, elapsed={:.1f}ms",
+                       len(results), fallback_elapsed)
+        # If only vector is enabled
+        elif not self.config.enable_bm25:
+            logger.info("[HYBRID] Using only vector search results")
+            if self._db.vector_enabled:
+                vector_start = time.perf_counter()
+                vector_results = await self._vector_retriever.search(expanded_query, top_k)
+                vector_elapsed = (time.perf_counter() - vector_start) * 1000
+                for result in vector_results:
+                    result.source = "vector"
+                results = vector_results
+                logger.info("[RAG PERF] Hybrid vector only: {} results, elapsed={:.1f}ms",
+                           len(results), vector_elapsed)
+        # Both enabled - normal hybrid search
+        elif self._db.vector_enabled:
             try:
                 # BM25 search: top 50 results (more for base)
                 bm25_start = time.perf_counter()
@@ -139,7 +170,8 @@ class HybridRetriever(Retriever):
                 logger.warning("Hybrid search failed, falling back to full-text search only: {}", e)
                 self._db.record_vector_disabled()
 
-        if not results:
+        # Fallback to BM25 if no results yet and BM25 is enabled
+        if not results and self.config.enable_bm25:
             fallback_start = time.perf_counter()
             fulltext_results = self._bm25_retriever._fulltext_search(expanded_query, top_k)
             fallback_elapsed = (time.perf_counter() - fallback_start) * 1000

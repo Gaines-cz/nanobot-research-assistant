@@ -191,9 +191,22 @@ class DataGenerator:
         if not all_chunks:
             return []
 
+        # Filter by content quality first
+        good_chunks = []
+        for chunk_id, content, doc_path, doc_filename in all_chunks:
+            cleaned_content = self._clean_chunk_content(content)
+            if self._is_good_quality_content(cleaned_content):
+                good_chunks.append((chunk_id, cleaned_content, doc_path, doc_filename))
+
+        if not good_chunks:
+            logger.warning("No good quality chunks found after filtering")
+            return []
+
+        logger.info("Selected {}/{} chunks after quality filtering", len(good_chunks), len(all_chunks))
+
         # Shuffle and take num_samples
-        random.shuffle(all_chunks)
-        chunks = all_chunks[:num_samples]
+        random.shuffle(good_chunks)
+        chunks = good_chunks[:num_samples]
 
         queries: List[EvalQuery] = []
 
@@ -289,6 +302,64 @@ class DataGenerator:
         text = re.sub(r'(\w+)-[\r\n\t ]+(\w+)', r'\1\2', text)
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
+
+    @staticmethod
+    def _clean_chunk_content(content: str) -> str:
+        """Clean chunk content by removing PDF parsing noise."""
+        # 1. Remove isolated number lines (table data residue)
+        content = re.sub(r'^\s*\d+(\.\d+)?\s*$', '', content, flags=re.MULTILINE)
+
+        # 2. Fix hyphenated word breaks
+        content = re.sub(r'(\w+)-[\r\n\t]+(\w+)', r'\1\2', content)
+        content = re.sub(r'(\w+)-[\r\n\t ]+(\w+)', r'\1\2', content)
+
+        # 3. Remove excessive empty lines (more than 2 consecutive)
+        content = re.sub(r'\n\s*\n\s*\n\s*\n', '\n\n\n', content)
+        content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)
+
+        # 4. Remove lines that are just punctuation/symbols
+        content = re.sub(r'^\s*[^\w\s\u4e00-\u9fff]+\s*$', '', content, flags=re.MULTILINE)
+
+        # 5. Normalize whitespace
+        content = re.sub(r'[ \t]+', ' ', content)
+
+        return content.strip()
+
+    @staticmethod
+    def _is_good_quality_content(content: str) -> bool:
+        """Check if content is good quality for test generation."""
+        if not content or len(content.strip()) < 100:
+            return False
+
+        # 1. Check valid text ratio (exclude mostly numbers/symbols)
+        total_chars = len(content)
+        text_chars = len(re.findall(r'[a-zA-Z\u4e00-\u9fff]', content))
+        if total_chars > 0 and text_chars / total_chars < 0.4:
+            return False
+
+        # 2. Check sentence count (at least 2 meaningful sentences)
+        sentences = re.split(r'[.!?]+', content)
+        meaningful_sentences = [s for s in sentences if len(s.strip()) > 30]
+        if len(meaningful_sentences) < 2:
+            return False
+
+        # 3. Check for references/index/table of contents (skip these)
+        start_content = content[:300].lower()
+        skip_keywords = [
+            'references', 'bibliography', 'index', 'table of contents',
+            'contents', 'figures', 'tables', 'appendix',
+            '参考文献', '目录', '索引', '附表', '附图'
+        ]
+        for keyword in skip_keywords:
+            if keyword in start_content:
+                return False
+
+        # 4. Check if it's mostly citations (e.g., [1], [2], etc.)
+        citation_markers = len(re.findall(r'\[\d+\]', content))
+        if citation_markers > 10 and len(content) < 500:
+            return False
+
+        return True
 
     async def precompute_embeddings(
         self,
