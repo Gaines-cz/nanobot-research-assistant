@@ -157,24 +157,21 @@ def _create_workspace_templates(workspace: Path):
             dest.write_text(item.read_text(encoding="utf-8"), encoding="utf-8")
             console.print(f"  [dim]Created {item.name}[/dim]")
 
+    # Memory directory: SQLite database will be created by MemoryStore
     memory_dir = workspace / "memory"
     memory_dir.mkdir(exist_ok=True)
+    console.print(f"  [dim]Created memory/ directory (SQLite DB will be created on first use)[/dim]")
 
-    # Memory files: create templates for all MemoryStore files
-    MEMORY_TEMPLATES = ["PROFILE", "PROJECTS", "PAPERS", "DECISIONS"]
-
-    for template_name in MEMORY_TEMPLATES:
-        template = templates_dir / "memory" / f"{template_name}.md.template"
-        dest = memory_dir / f"{template_name}.md"
-        if not dest.exists():
-            dest.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
-            console.print(f"  [dim]Created memory/{template_name}.md[/dim]")
-
-    # HISTORY.md: empty file for append-only logging
-    history_file = memory_dir / "HISTORY.md"
-    if not history_file.exists():
-        history_file.write_text("", encoding="utf-8")
-        console.print("  [dim]Created memory/HISTORY.md[/dim]")
+    # PROFILE.md: Still file-based for user preferences
+    profile_file = memory_dir / "PROFILE.md"
+    if not profile_file.exists():
+        template = templates_dir / "memory" / "PROFILE.md.template"
+        if template.exists():
+            profile_file.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+            console.print(f"  [dim]Created memory/PROFILE.md[/dim]")
+        else:
+            profile_file.write_text("# 用户画像\n\n", encoding="utf-8")
+            console.print(f"  [dim]Created memory/PROFILE.md[/dim]")
 
     (workspace / "skills").mkdir(exist_ok=True)
 

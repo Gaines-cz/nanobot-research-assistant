@@ -177,31 +177,31 @@ class TestMemoryIncrementalOperations:
     def test_prepend_to_empty_file(self, tmp_path: Path) -> None:
         """Prepend to empty file should create content without extra newlines."""
         store = MemoryStore(tmp_path)
-        store.prepend(MemoryFile.TODOS, "- Task 1")
+        store.prepend(MemoryFile.PROJECTS, "- Project 1")
 
-        content = store.read_file(MemoryFile.TODOS)
-        assert content.strip() == "- Task 1"
+        content = store.read_file(MemoryFile.PROJECTS)
+        assert content.strip() == "- Project 1"
 
     def test_prepend_to_existing_file(self, tmp_path: Path) -> None:
         """Prepend should add new content at the beginning."""
         store = MemoryStore(tmp_path)
-        store.prepend(MemoryFile.TODOS, "- Task 2")
-        store.prepend(MemoryFile.TODOS, "- Task 1 (urgent)")
+        store.prepend(MemoryFile.PROJECTS, "- Project 2")
+        store.prepend(MemoryFile.PROJECTS, "- Project 1 (urgent)")
 
-        content = store.read_file(MemoryFile.TODOS)
-        assert content.startswith("- Task 1 (urgent)")
-        assert "Task 2" in content
+        content = store.read_file(MemoryFile.PROJECTS)
+        assert content.startswith("- Project 1 (urgent)")
+        assert "Project 2" in content
 
     def test_replace_entire_file(self, tmp_path: Path) -> None:
         """Replace should overwrite entire file content."""
         store = MemoryStore(tmp_path)
-        store.replace(MemoryFile.TODOS, "- Old task")
-        store.replace(MemoryFile.TODOS, "- New task 1\n- New task 2")
+        store.replace(MemoryFile.PROJECTS, "- Old project")
+        store.replace(MemoryFile.PROJECTS, "- New project 1\n- New project 2")
 
-        content = store.read_file(MemoryFile.TODOS)
-        assert "Old task" not in content
-        assert "- New task 1" in content
-        assert "- New task 2" in content
+        content = store.read_file(MemoryFile.PROJECTS)
+        assert "Old project" not in content
+        assert "- New project 1" in content
+        assert "- New project 2" in content
 
     def test_update_section_creates_new(self, tmp_path: Path) -> None:
         """update_section should create section if it doesn't exist."""
@@ -251,16 +251,15 @@ class TestMemoryIncrementalOperations:
 class TestMemoryContextLoading:
     """Test selective memory loading based on query."""
 
-    def test_default_loads_profile_and_todos(self, tmp_path: Path) -> None:
-        """Without query, should load PROFILE and TODOS by default."""
+    def test_default_loads_profile_only(self, tmp_path: Path) -> None:
+        """Without query, should load PROFILE by default (TODOS removed, tasks now in PROJECTS)."""
         store = MemoryStore(tmp_path)
         store.replace(MemoryFile.PROFILE, "User preferences")
-        store.replace(MemoryFile.TODOS, "Current tasks")
+        store.replace(MemoryFile.PROJECTS, "Current tasks")
         store.replace(MemoryFile.PAPERS, "Paper notes")
 
         context = store.get_memory_context()
         assert "User preferences" in context
-        assert "Current tasks" in context
         assert "Paper notes" not in context
 
     def test_query_triggers_papers(self, tmp_path: Path) -> None:

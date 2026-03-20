@@ -21,9 +21,10 @@ class Session:
     Stores messages in JSONL format for easy reading and persistence.
 
     Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to memory files (PROFILE.md,
-    PROJECTS.md, PAPERS.md, DECISIONS.md, TODOS.md, HISTORY.md) but does NOT
-    modify the messages list or get_history() output.
+    The consolidation process writes summaries to memory system:
+    - PROFILE.md: User profile (file-based)
+    - SQLite database (memory/memory.db): HISTORY, KNOWLEDGE, DECISIONS, PROJECTS
+    But does NOT modify the messages list or get_history() output.
     """
 
     key: str  # channel:chat_id

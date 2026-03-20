@@ -18,7 +18,7 @@
 │         │                                    │                   │
 │         │                                    ▼                   │
 │         │                          ┌──────────────────┐        │
-│         │                          │  6个 MemoryFile  │        │
+│         │                          │  5个 MemoryFile  │        │
 │         │                          │  (PROFILE等)     │        │
 │         │                          └──────────────────┘        │
 │         │                                                      │
@@ -36,7 +36,7 @@
 
 ## 2. MemoryStore 类 (`nanobot/agent/memory.py`)
 
-### 2.1 6 个记忆文件 (MemoryFile Enum)
+### 2.1 5 个记忆文件 (MemoryFile Enum)
 
 | 文件名 | 用途 | 更新频率 |
 |--------|------|----------|
@@ -44,7 +44,6 @@
 | `PROJECTS.md` | 项目知识（技术栈、架构、进度） | 半稳定 |
 | `PAPERS.md` | 论文笔记（读过的论文、关键发现） | 增量，追加新条目 |
 | `DECISIONS.md` | 决策记录（为什么选 A 不选 B） | 增量 |
-| `TODOS.md` | Todo 列表 | 频繁更新，用 replace |
 | `HISTORY.md` | 事件日志（append-only） | 每次固化都追加 |
 
 **重要提醒**: 所有记忆文件只用于存储 USER-related content，**禁止存储 AI 助手配置**（模型名、版本号等）。
@@ -113,7 +112,7 @@ build_system_prompt(skill_names, query)
 │
 ├─ 3. Memory (关键部分) ← MemoryStore.get_memory_context(query)
 │   ├─ 总是加载: PROFILE.md
-│   ├─ 默认加载: TODOS.md
+│   ├─ 默认加载: (无 - 任务在 PROJECTS.md 中)
 │   └─ 根据 query 关键词加载:
 │       ├─ 论文相关关键词 → PAPERS.md
 │       ├─ 项目相关关键词 → PROJECTS.md
@@ -131,7 +130,7 @@ build_system_prompt(skill_names, query)
 PROFILE.md → "## Profile"
 
 # 默认加载
-TODOS.md → "## Current Tasks"
+# (无 - 任务现在记录在 PROJECTS.md 中)
 
 # 根据 query 关键词条件加载
 query 含 "论文", "paper", "arxiv" → PAPERS.md → "## Paper Notes"
@@ -411,7 +410,7 @@ _SAVE_MEMORY_TOOL = [{
         "history_entry": "总结段落（2-5 句话，以 [YYYY-MM-DD HH:MM] 开头）",
         "operations": [
             {
-                "file": "profile|projects|papers|decisions|todos",
+                "file": "profile|projects|papers|decisions",
                 "action": "append|prepend|update_section|replace|delete_section|skip",
                 "section": "section name (可选)",
                 "content": "内容 (可选)"
@@ -527,7 +526,7 @@ async def _process_message(msg):
 │    │  ├─ Bootstrap files                                     │
 │    │  ├─ Memory (来自 MemoryStore)                           │
 │    │  │  ├─ PROFILE.md (总是)                               │
-│    │  │  ├─ TODOS.md (默认)                                 │
+│    │  │  ├─ PROJECTS.md (默认, 含任务进度)                   │
 │    │  │  ├─ PAPERS.md (如 query 含论文关键词)                │
 │    │  │  ├─ PROJECTS.md (如 query 含项目关键词)              │
 │    │  │  └─ DECISIONS.md (如 query 含决策关键词)             │
@@ -620,13 +619,12 @@ Memory Files
 - `projects` → `PROJECTS.md`
 - `papers` → `PAPERS.md`
 - `decisions` → `DECISIONS.md`
-- `todos` → `TODOS.md`
 - `history` → `HISTORY.md`
 
 **使用示例**:
 ```bash
 nanobot memory view profile
-nanobot memory view todos
+nanobot memory view projects
 ```
 
 **实现位置**: `commands.py:1516-1553`
@@ -635,7 +633,7 @@ nanobot memory view todos
 
 ### 9.4 `memory search <query>` - 搜索记忆
 
-**功能**: 在所有 6 个记忆文件中搜索关键词（不区分大小写）。
+**功能**: 在所有 5 个记忆文件中搜索关键词（不区分大小写）。
 
 **特点**:
 - 搜索所有记忆文件（包括 HISTORY.md）
@@ -705,7 +703,7 @@ PAPERS.md:23
 3. **Token 成本考量**:
    - 每次都把完整历史发给 LLM 很贵
    - 固化后只加载相关记忆，显著节省 token
-   - 例如：PROFILE + TODOS 通常只有几百 token，而完整历史可能有几万 token
+   - 例如：PROFILE + PROJECTS 通常只有几百 token，而完整历史可能有几万 token
 
 4. **我的设计权衡**:
    - 保留最近一半消息 (`keep_count = memory_window // 2`)
@@ -729,7 +727,7 @@ PAPERS.md:23
    | 记忆类型 | 访问模式 | 最佳存储 |
    |---------|---------|---------|
    | PROFILE | 总是全量加载 | 小文件，全量读 |
-   | TODOS | 频繁全量替换 | 小文件，全量写 |
+   | PROJECTS | 频繁全量替换 | 小文件，全量写 |
    | PAPERS | 增量追加，按主题检索 | 可选向量化 |
    | HISTORY | 只写不读 | append-only 日志 |
 

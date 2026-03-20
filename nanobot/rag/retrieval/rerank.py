@@ -125,7 +125,13 @@ class CrossEncoderReranker(Reranker):
 
         try:
             # Prepare pairs: (query, candidate)
-            pairs = [(query, candidate) for candidate in candidates]
+            # Truncate candidate to avoid exceeding model's 512 token limit
+            # Conservative: allow up to 150 tokens for query (~50 chars), 362 for candidate (~400 chars)
+            MAX_CANDIDATE_CHARS = 400
+            pairs = [
+                (query, candidate[:MAX_CANDIDATE_CHARS] if len(candidate) > MAX_CANDIDATE_CHARS else candidate)
+                for candidate in candidates
+            ]
 
             # Run inference in thread pool
             loop = asyncio.get_event_loop()

@@ -219,7 +219,7 @@ class AgentDefaults(Base):
     consolidation_pause_min_messages: int = 10  # 暂停触发最小消息数
     consolidation_important_check_window: int = 5  # 检查最近 N 条消息的关键词
     consolidation_important_min_messages: int = 5  # 重要内容触发最小消息数
-    consolidation_timeout_seconds: int = 90  # Memory consolidation 超时时间（秒）
+    consolidation_timeout_seconds: int = 300  # Memory consolidation 超时时间（秒）
 
 
 class AgentsConfig(Base):
@@ -341,7 +341,7 @@ class RAGDefaults:
     DEDUP_THRESHOLD: float = 0.7
 
     # Reranker
-    RERANK_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     RERANK_TOP_K: int = 20
 
     # Rerank deduplication embedding (for semantic dedup)

@@ -1,9 +1,17 @@
-"""Multi-file memory system with incremental operations."""
+"""
+MemoryStore with hybrid search using SQLite + RAG components.
+
+This module provides the memory system with:
+- SQLite-backed storage via MemoryDatabase
+- Hybrid search: BM25 + Vector + RRF fusion + CrossEncoder reranking
+- 2-step consolidation flow for memory evolution
+"""
 
 from __future__ import annotations
 
-import json
+import math
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -11,1036 +19,1036 @@ from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir
+from nanobot.agent.memory_db import MemoryDatabase
+from nanobot.rag.embeddings import EmbeddingProvider
+from nanobot.rag.retrieval.rerank import CrossEncoderReranker
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
-    from nanobot.rag.embeddings import EmbeddingProvider
-    from nanobot.rag.store import DocumentStore
     from nanobot.session.manager import Session
 
 
-class MemoryFile(Enum):
-    """Memory file types."""
+class MemoryType(Enum):
+    """Memory type enumeration."""
+    HISTORY = "HISTORY"
+    KNOWLEDGE = "KNOWLEDGE"
+    DECISIONS = "DECISIONS"
+    PROJECTS = "PROJECTS"
 
-    PROFILE = "PROFILE.md"
-    PROJECTS = "PROJECTS.md"
-    PAPERS = "PAPERS.md"
-    DECISIONS = "DECISIONS.md"
-    # TODOS removed - tasks now in PROJECTS.md
-    HISTORY = "HISTORY.md"
+
+# Constants for hybrid search
+BM25_TOP_K = 50
+VECTOR_TOP_K = 50
+RERANK_TOP_K = 20
+RECALL_TOP_K = 50
+
+# Scoring weights for comprehensive ranking
+MODEL_SCORE_WEIGHT = 0.7
+FREQ_SCORE_WEIGHT = 0.2
+RECENCY_SCORE_WEIGHT = 0.1
+
+# Max read times for normalization
+MAX_READ_TIMES = 100
+
+# Recency decay lambda (days)
+RECENCY_DECAY_LAMBDA = 0.1
 
 
 @dataclass
-class MemoryOperation:
-    """A single memory operation."""
-
-    file: MemoryFile
-    action: str  # append | prepend | update_section | replace | delete_section | skip
-    content: Optional[str] = None
-    section: Optional[str] = None
-
-
-# Tool schema for LLM to call
-_SAVE_MEMORY_TOOL = [
-    {
-        "type": "function",
-        "function": {
-            "name": "save_memory",
-            "description": "Save memory updates with incremental operations.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "history_entry": {
-                        "type": "string",
-                        "description": "A paragraph (2-5 sentences) summarizing key events. Start with [YYYY-MM-DD HH:MM].",
-                    },
-                    "operations": {
-                        "type": "array",
-                        "description": "List of memory operations to perform.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "file": {
-                                    "type": "string",
-                                    "enum": ["profile", "projects", "papers", "decisions", ],
-                                    "description": "Target memory file.",
-                                },
-                                "action": {
-                                    "type": "string",
-                                    "enum": ["append", "prepend", "update_section", "replace", "delete_section", "skip"],
-                                    "description": "Operation type.",
-                                },
-                                "section": {
-                                    "type": "string",
-                                    "description": "Section name for update_section or delete_section action.",
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "Content to write.",
-                                },
-                            },
-                            "required": ["file", "action"],
-                        },
-                    },
-                },
-                "required": ["history_entry", "operations"],
-            },
-        },
-    }
-]
-
-MEMORY_FILES_DESC = """## Memory Files
-
-IMPORTANT: These files are for USER-related content only. DO NOT store AI assistant configuration here.
-
-- **profile**: USER profile - user's research direction, preferences, technical background. Stable, rarely changes.
-  ❌ DO NOT store: AI name, model configuration, version info
-  ✅ Store: User's research interests, preferred tools, background
-
-- **projects**: Project knowledge - tech stack, architecture, progress. Semi-stable.
-- **papers**: Paper notes - papers read, key findings. Incremental, append new entries.
-- **decisions**: Decision records - why A over B. Incremental.
-# - **todos**: Todo list. Frequently updated, use replace action.
-
-## Actions
-
-- **append**: Add content to end of file.
-- **prepend**: Add content to beginning of file.
-- **update_section**: Update or create a section (requires section name).
-- **replace**: Replace entire file content.
-- **delete_section**: Delete a section and its content (requires section name). Idempotent.
-- **skip**: Do nothing."""
+class MemorySearchResult:
+    """Memory search result with metadata."""
+    id: int
+    type: str
+    detail: str
+    at_time: int
+    read_times: int
+    last_read_time: int
+    model_score: float = 0.0
+    final_score: float = 0.0
+    source: str = ""  # "bm25", "vector", "rrf"
 
 
 class MemoryStore:
-    """Multi-file memory store with incremental operations."""
+    """
+    SQLite-backed memory store with hybrid search.
 
-    MEMORY_FILES = {
-        "profile": MemoryFile.PROFILE,
-        "projects": MemoryFile.PROJECTS,
-        "papers": MemoryFile.PAPERS,
-        "decisions": MemoryFile.DECISIONS,
-    }
-
-    MAX_MEMORY_FILE_LENGTH = 3000  # 单个 memory 文件最大长度
+    Features:
+    - SQLite storage via MemoryDatabase
+    - Hybrid search: BM25 + Vector + RRF fusion + CrossEncoder reranking
+    - Comprehensive scoring: model_score * 0.7 + freq_score * 0.2 + recency_score * 0.1
+    - 2-step consolidation for memory evolution
+    """
 
     def __init__(
         self,
         workspace: Path,
         embedding_provider: Optional[EmbeddingProvider] = None,
-        rag_store: Optional["DocumentStore"] = None,
+        memory_db_path: Optional[Path] = None,
     ):
-        self.memory_dir = ensure_dir(workspace / "memory")
+        """
+        Initialize MemoryStore.
+
+        Args:
+            workspace: Workspace path for memory storage
+            embedding_provider: Optional embedding provider for vector search
+            memory_db_path: Optional custom path for memory database
+        """
+        self._workspace = workspace
         self._embedding_provider = embedding_provider
-        self._rag_store = rag_store  # RAG store for memory search (enables RAG-based consolidation)
 
-    # === Safe Write Helper ===
-
-    def _safe_write(self, path: Path, content: str) -> None:
-        """
-        安全写入文件（临时文件 + rename，原子操作）。
-
-        Args:
-            path: 目标文件路径
-            content: 要写入的内容
-
-        Raises:
-            Exception: 写入失败时抛出
-        """
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        try:
-            # 先写临时文件
-            tmp_path.write_text(content, encoding="utf-8")
-            # 原子替换
-            tmp_path.rename(path)
-        except Exception:
-            # 清理临时文件
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except Exception:
-                pass  # 清理失败不影响主错误
-            raise
-
-    # === Read Operations ===
-
-    def read_file(self, file: MemoryFile) -> str:
-        """Read a memory file."""
-        path = self.memory_dir / file.value
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return ""
-
-    def read_section(self, file: MemoryFile, section: str) -> Optional[str]:
-        """Read a specific section from a memory file."""
-        content = self.read_file(file)
-        # Match: ## Section Name\n...content...\n(?=##|$)
-        pattern = rf"##\s+{re.escape(section)}\s*(?:\n|$)(.*?)(?=\n##\s|\Z)"
-        match = re.search(pattern, content, re.DOTALL)
-        return match.group(1).strip() if match and match.group(1) else None
-
-    # === Write Operations ===
-
-    def append(self, file: MemoryFile, content: str) -> None:
-        """Append content to file."""
-        path = self.memory_dir / file.value
-        existing = self.read_file(file)
-        if existing:
-            new_content = existing.rstrip() + "\n\n" + content.strip() + "\n"
+        # Initialize memory database
+        if memory_db_path:
+            self._db_path = memory_db_path
         else:
-            new_content = content.strip() + "\n"
-        self._safe_write(path, new_content)
+            self._db_path = workspace / "memory" / "memory.db"
+        self._db = MemoryDatabase(self._db_path)
 
-    async def append_with_dedup(
-        self,
-        file: MemoryFile,
-        content: str,
-        *,
-        similarity_threshold: float = 0.8,
-    ) -> bool:
-        """
-        追加内容，自动跳过重复内容。
+        # Initialize memory-specific FTS5 table for BM25 search
+        self._init_memory_fts()
 
-        先检查精确匹配，再检查语义相似（需要 embedding_provider）。
+        # Initialize memory-specific vector storage
+        self._vec_enabled = False
+        self._init_memory_vectors()
 
-        Args:
-            file: 目标记忆文件
-            content: 要追加的内容
-            similarity_threshold: 语义相似度阈值，默认 0.8
+        # Reranker for hybrid search
+        self._reranker = CrossEncoderReranker()
 
-        Returns:
-            True: 成功追加
-            False: 跳过（重复内容）
-        """
-        if not content or not content.strip():
-            return False
+        logger.info(
+            "[MemoryStore] Initialized with hybrid search: BM25 + Vector (vec_enabled={})",
+            self._vec_enabled
+        )
 
-        existing = self.read_file(file)
-        content_stripped = content.strip()
-
-        # Layer 1: 精确匹配
-        if content_stripped in existing:
-            logger.debug("Exact content already exists in {}, skipping", file.value)
-            return False
-
-        # Layer 2: 语义相似（可选）
-        if self._embedding_provider:
-            try:
-                if await self._is_semantically_similar(content_stripped, existing, similarity_threshold):
-                    logger.debug("Similar content already exists in {}, skipping", file.value)
-                    return False
-            except Exception as e:
-                logger.warning("Semantic similarity check failed: {}", e)
-                # 失败时不阻止追加
-
-        self.append(file, content)
-        return True
-
-    async def _is_semantically_similar(
-        self,
-        content: str,
-        existing: str,
-        threshold: float,
-    ) -> bool:
-        """检查内容是否与已有内容语义相似。"""
-        if not existing.strip():
-            return False
-
+    def _init_memory_fts(self) -> None:
+        """Initialize memory-specific FTS5 table for BM25 search."""
         try:
-            # 将已有内容按段落分割
-            paragraphs = [p.strip() for p in existing.split("\n\n") if p.strip()]
-            if not paragraphs:
-                return False
-
-            # 性能优化：限制最大段落数，避免批量过大
-            # 如果段落过多，只检查前 100 个段落（覆盖绝大多数场景）
-            max_paragraphs = 100
-            if len(paragraphs) > max_paragraphs:
-                logger.debug(
-                    "Paragraph count {} exceeds limit {}, truncating for performance",
-                    len(paragraphs), max_paragraphs
+            conn = self._db._conn
+            # Create FTS5 virtual table for memory content search
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    detail,
+                    content=memories,
+                    content_rowid=id,
+                    tokenize='porter unicode61'
                 )
-                paragraphs = paragraphs[:max_paragraphs]
-
-            # 批量 embedding：一次性获取所有段落和内容的 embedding
-            # 性能提升：从 O(n) 次 API 调用降至 O(1) 次
-            all_texts = [content] + paragraphs
-            embeddings = await self._embedding_provider.embed_batch(all_texts)
-
-            content_embedding = embeddings[0]
-            para_embeddings = embeddings[1:]
-
-            # 并行计算相似度
-            for para_embedding in para_embeddings:
-                similarity = self._cosine_similarity(content_embedding, para_embedding)
-                if similarity >= threshold:
-                    return True
-
-            return False
+            """)
+            # Create triggers for automatic index updates
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memories_fts(rowid, detail) VALUES (new.id, new.detail);
+                END
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, detail) VALUES('delete', old.id, old.detail);
+                END
+            """)
+            conn.commit()
+            logger.debug("[MemoryStore] FTS5 table for memories initialized")
         except Exception as e:
-            logger.warning("Semantic similarity check failed: {}", e)
-            return False  # 失败时不阻止追加
+            logger.warning("[MemoryStore] Failed to initialize FTS5: {}", e)
 
-    @staticmethod
-    def _cosine_similarity(a: list[float], b: list[float]) -> float:
-        """计算余弦相似度。"""
-        from nanobot.utils.helpers import cosine_similarity
-        return cosine_similarity(a, b)
-
-    def prepend(self, file: MemoryFile, content: str) -> None:
-        """Prepend content to file."""
-        path = self.memory_dir / file.value
-        existing = self.read_file(file)
-        if existing:
-            new_content = content.strip() + "\n\n" + existing
-        else:
-            new_content = content.strip() + "\n"
-        self._safe_write(path, new_content)
-
-    def update_section(self, file: MemoryFile, section: str, content: str) -> None:
-        """Update or add a section in file."""
-        old_content = self.read_file(file)
-        section_header = f"## {section}"
-        content_stripped = content.strip()
-        new_section = f"{section_header}\n{content_stripped}\n"
-
-        # 检查 section 是否已存在相同内容（去重）
-        if content_stripped:
-            pattern = rf"##\s+{re.escape(section)}\s*(?:\n|$)(.*?)(?=\n##\s|\Z)"
-            match = re.search(pattern, old_content, re.DOTALL)
-            if match:
-                existing_group = match.group(1)
-                existing_content = existing_group.strip() if existing_group else ""
-                # 跳过空 content 或看起来像 section header 的情况（regex 边界）
-                if existing_content and not existing_content.startswith("##"):
-                    if existing_content == content_stripped:
-                        logger.debug("Same content already exists in section {}, skipping", section)
-                        return
-
-        # Check if section exists
-        pattern = rf"##\s+{re.escape(section)}\s*(?:\n|$).*?(?=\n##\s|\Z)"
-        if re.search(pattern, old_content, re.DOTALL):
-            # Replace existing section
-            new_content = re.sub(pattern, new_section.rstrip(), old_content, flags=re.DOTALL)
-        elif old_content:
-            # Add new section to existing file
-            new_content = old_content.rstrip() + "\n\n" + new_section
-        else:
-            # First section in empty file
-            new_content = new_section
-
-        path = self.memory_dir / file.value
-        self._safe_write(path, new_content)
-
-        # Verify the update worked: check that section header was actually written
-        verification = self.read_file(file)
-        # 验证 section header 存在（比验证 content 更健壮）
-        if section_header not in verification:
-            logger.warning(
-                "Section update verification failed: header not found after write. "
-                "Section: {}, File: {}",
-                section, file.value
-            )
-            self.replace(file, old_content)
-
-    def delete_section(self, file: MemoryFile, section: str) -> bool:
-        """
-        Delete a section from a memory file.
-
-        Args:
-            file: Target memory file
-            section: Section name to delete
-
-        Returns:
-            True on success (including idempotent case where section doesn't exist),
-            False on verification failure
-        """
-        old_content = self.read_file(file)
-
-        # If file is empty, return True (idempotent)
-        if not old_content or not old_content.strip():
-            logger.debug("File {} is empty, nothing to delete", file.value)
-            return True
-
-        # Check if section exists first
-        # Pattern: match from ## Section to the next ## or end of file
-        existence_pattern = rf"##\s+{re.escape(section)}\s*(?:\n|$).*?(?=\n##\s|\Z)"
-        if not re.search(existence_pattern, old_content, flags=re.DOTALL):
-            # Section didn't exist, nothing to delete
-            logger.debug("Section '{}' not found in {}, nothing to delete", section, file.value)
-            return True
-
-        # Remove the section
-        new_content = re.sub(existence_pattern, "", old_content, flags=re.DOTALL)
-
-        # Clean up: remove extra blank lines that may result from deletion
-        new_content = re.sub(r"\n{3,}", "\n\n", new_content).strip() + "\n"
-
-        path = self.memory_dir / file.value
-        self._safe_write(path, new_content)
-
-        # Verify: section header should no longer exist
-        # Check as a proper section header (not a substring of another header)
-        verification = self.read_file(file)
-        # Pattern: match section header at start of line, with word boundary
-        # Use the same pattern logic as delete regex for consistency
-        verification_pattern = rf"^##\s+{re.escape(section)}\s*(?:\n|$)"
-        if re.search(verification_pattern, verification, re.MULTILINE):
-            logger.warning(
-                "Section delete verification failed: header still exists after write. "
-                "Section: {}, File: {}",
-                section, file.value
-            )
-            # Rollback
-            self.replace(file, old_content)
-            return False
-
-        logger.info("Deleted section '{}' from {}", section, file.value)
-        return True
-
-    def replace(self, file: MemoryFile, content: str) -> None:
-        """Replace entire file content."""
-        path = self.memory_dir / file.value
-        self._safe_write(path, content.strip() + "\n")
-
-    def apply_operation(self, op: MemoryOperation) -> bool:
-        """Apply a single memory operation. Returns True on success."""
-        if op.action == "skip":
-            return True
-
-        # Validate required parameters
-        if op.action in ("update_section", "delete_section") and not op.section:
-            logger.warning(f"{op.action} requires section parameter, skipping")
-            return False
-        if op.action in ("append", "prepend", "update_section", "replace") and op.content is None:
-            logger.warning(f"{op.action} requires content parameter, skipping")
-            return False
-
-        # Log operation
-        log_msg = f"[Memory] {op.action} on {op.file.value}"
-        if op.section:
-            log_msg += f" (section: {op.section})"
-        logger.info(log_msg)
-
-        if op.action == "append":
-            # 精确匹配去重（同步版本，适用于 consolidation）
-            existing = self.read_file(op.file)
-            if op.content.strip() in existing:
-                logger.debug("Exact content already exists in {}, skipping", op.file.value)
-                return True
-            self.append(op.file, op.content)
-        elif op.action == "prepend":
-            # 精确匹配去重（同步版本，适用于 consolidation）
-            existing = self.read_file(op.file)
-            if op.content.strip() in existing:
-                logger.debug("Exact content already exists in {}, skipping", op.file.value)
-                return True
-            self.prepend(op.file, op.content)
-        elif op.action == "update_section":
-            self.update_section(op.file, op.section, op.content)
-        elif op.action == "replace":
-            self.replace(op.file, op.content)
-        elif op.action == "delete_section":
-            if not self.delete_section(op.file, op.section):
-                return False
-
-        return True
-
-    def apply_operations_atomic(self, operations: list[dict]) -> bool:
-        """Apply multiple operations atomically. All succeed or all fail."""
-        applied: list[tuple[MemoryFile, str]] = []  # (file, old_content) for rollback
-
-        try:
-            for op_data in operations:
-                file_name = op_data.get("file")
-                action = op_data.get("action", "skip")
-
-                if file_name not in self.MEMORY_FILES:
-                    logger.warning("Unknown memory file: {}", file_name)
-                    raise ValueError(f"Unknown file: {file_name}")
-
-                # 保存旧内容用于回滚
-                file = self.MEMORY_FILES[file_name]
-                old_content = self.read_file(file)
-                applied.append((file, old_content))
-
-                op = MemoryOperation(
-                    file=file,
-                    action=action,
-                    content=op_data.get("content"),
-                    section=op_data.get("section"),
-                )
-
-                if not self.apply_operation(op):
-                    raise Exception(f"Operation failed: {op_data}")
-
-            return True
-
-        except Exception as e:
-            logger.error("Atomic operation failed, rolling back: {}", e)
-            rollback_failed = []
-
-            for file, old_content in reversed(applied):
-                try:
-                    self.replace(file, old_content)
-                    logger.debug("Rollback succeeded for {}", file.value)
-                except Exception as rollback_e:
-                    logger.error("Rollback failed for {}: {}", file.value, rollback_e)
-                    rollback_failed.append(file)
-
-            if rollback_failed:
-                logger.critical(
-                    "Rollback incomplete - manual intervention may be needed: {}",
-                    [f.value for f in rollback_failed]
-                )
-            return False
-
-    def append_history(self, entry: str) -> None:
-        """Append to history log."""
-        # 类型防御 + 空值检查
-        if not isinstance(entry, str):
-            logger.warning("append_history received non-string type: {}", type(entry).__name__)
-            entry = str(entry)
-        if not entry or not entry.strip():
-            logger.debug("Skipping empty history entry")
+    def _init_memory_vectors(self) -> None:
+        """Initialize memory-specific vector storage using sqlite-vec."""
+        if self._embedding_provider is None:
+            logger.debug("[MemoryStore] No embedding provider, vector search disabled")
             return
-        path = self.memory_dir / MemoryFile.HISTORY.value
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(entry.rstrip() + "\n\n")
 
-    # === Context Loading ===
+        try:
+            import sqlite_vec
 
-    def get_memory_context(self, query: str | None = None) -> str:
+            conn = self._db._conn
+
+            # Enable extension loading and load sqlite-vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+
+            # Get embedding dimensions
+            dims = self._embedding_provider.dimensions
+
+            # Create memory embeddings table
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(
+                    memory_id INTEGER PRIMARY KEY,
+                    embedding FLOAT32[{dims}]
+                )
+            """)
+            conn.commit()
+
+            self._vec_enabled = True
+            logger.info("[MemoryStore] Vector storage enabled (dims={})", dims)
+        except Exception as e:
+            logger.warning("[MemoryStore] Vector storage disabled: {}", e)
+            self._vec_enabled = False
+
+    async def _bm25_search(self, query: str, type_filter: Optional[str] = None, top_k: int = BM25_TOP_K) -> list[MemorySearchResult]:
         """
-        Get memory context for system prompt.
-
-        Only PROFILE is loaded by default. Other memory files
-        (PAPERS, PROJECTS, DECISIONS) are NOT loaded into the system prompt -
-        the LLM should use the read_file tool to access them when needed.
-        """
-        parts = []
-        loaded_files = []
-        max_file_length = self.MAX_MEMORY_FILE_LENGTH
-
-        def truncate_content(content: str, max_len: int) -> str:
-            """Truncate content if too long, add notice at end."""
-            if len(content) <= max_len:
-                return content
-            # 优先保留开头和结尾，中间截断
-            keep_start = int(max_len * 0.6)
-            keep_end = int(max_len * 0.3)
-            truncated = (
-                content[:keep_start]
-                + f"\n\n... [truncated, {len(content) - keep_start - keep_end} chars omitted] ...\n\n"
-                + content[-keep_end:]
-            )
-            return truncated
-
-        # Always load profile - user's preferences and research direction
-        profile = self.read_file(MemoryFile.PROFILE)
-        if profile:
-            profile_truncated = truncate_content(profile, max_file_length)
-            parts.append(f"## Profile\n{profile_truncated}")
-            loaded_files.append(f"profile={len(profile_truncated)}")
-
-#        # Always load todos - current tasks
-#        todos = self.read_file(MemoryFile.TODOS)
-#        if todos:
-#            todos_truncated = truncate_content(todos, max_file_length)
-#            parts.append(f"## Current Tasks\n{todos_truncated}")
-#            loaded_files.append(f"todos={len(todos_truncated)}")
-
-        # NOTE: PAPERS, PROJECTS, DECISIONS are NOT loaded here!
-        # The LLM should use read_file tool to access them when needed.
-
-        result = "\n\n---\n\n".join(parts) if parts else ""
-
-        # 记录加载的 memory 文件及其长度
-        if loaded_files:
-            logger.debug("Memory context loaded: {}, total={}", ", ".join(loaded_files), len(result))
-
-        return result
-
-    def _get_memory_summary(self) -> str:
-        """Get summary of all memory files for LLM prompt."""
-        summaries = []
-        for name, file in self.MEMORY_FILES.items():
-            content = self.read_file(file)
-            if content:
-                lines = content.strip().split("\n")
-                summaries.append(f"- {name}: {len(lines)} lines")
-            else:
-                summaries.append(f"- {name}: (empty)")
-        return "\n".join(summaries)
-
-    def _get_messages_to_consolidate(
-        self,
-        session: Session,
-        archive_all: bool,
-        memory_window: int,
-    ) -> tuple[list[dict], int]:
-        """
-        获取需要固化的消息。
-
-        Returns:
-            (old_messages, keep_count): 要固化的消息列表，保留的消息数量
-        """
-        if archive_all:
-            old_messages = session.messages
-            keep_count = 0
-            logger.info("Memory consolidation started (archive_all): total_messages={}", len(session.messages))
-        else:
-            keep_count = memory_window // 2
-            if len(session.messages) <= keep_count:
-                logger.debug("Memory consolidation skipped: {} messages <= keep_count {}", len(session.messages), keep_count)
-                return [], 0
-            if len(session.messages) - session.last_consolidated <= 0:
-                logger.debug("Memory consolidation skipped: no unconsolidated messages")
-                return [], 0
-            old_messages = session.messages[session.last_consolidated : -keep_count]
-            if not old_messages:
-                logger.debug("Memory consolidation skipped: empty old_messages slice")
-                return [], 0
-            logger.info("Memory consolidation started: total_messages={}, old_messages={}, keep_count={}",
-                        len(session.messages), len(old_messages), keep_count)
-
-        return old_messages, keep_count
-
-    def _process_save_memory_tool_call(
-        self,
-        response,
-    ) -> tuple[dict, list[dict]] | None:
-        """
-        处理 save_memory tool call，提取 arguments。
-
-        Returns:
-            (args, operations) 或 None（如果没有有效 tool call）
-        """
-        if not response.has_tool_calls:
-            content_preview = (response.content[:200] + "...") if response.content else "None"
-            logger.warning(
-                "Memory consolidation: LLM did not call save_memory, skipping. "
-                "finish_reason={}, content_preview={}",
-                response.finish_reason,
-                content_preview
-            )
-            return None
-
-        # Find all save_memory tool calls
-        save_memory_calls = [tc for tc in response.tool_calls if tc.name == "save_memory"]
-
-        if not save_memory_calls:
-            logger.warning("Memory consolidation: no save_memory tool call found")
-            return None
-
-        # Process the first save_memory call
-        args = save_memory_calls[0].arguments
-
-        # Log if there are additional calls we're ignoring
-        if len(save_memory_calls) > 1:
-            logger.warning(
-                "Memory consolidation: {} save_memory calls found, processing only the first",
-                len(save_memory_calls)
-            )
-
-        # Some providers return arguments as a JSON string instead of dict
-        if isinstance(args, str):
-            args = json.loads(args)
-        if not isinstance(args, dict):
-            logger.warning(
-                "Memory consolidation: unexpected arguments type {}", type(args).__name__
-            )
-            return None
-
-        operations = args.get("operations", [])
-        return args, operations
-
-    async def _apply_save_memory_operations(
-        self,
-        args: dict,
-        operations: list[dict],
-        session: Session,
-        keep_count: int,
-        archive_all: bool,
-        is_rag_mode: bool = False,
-    ) -> bool:
-        """
-        应用 save_memory tool 的操作。
+        Perform BM25 full-text search on memories.
 
         Args:
-            args: tool call 的 arguments
-            operations: 要应用的操作列表
-            session: Session 对象
-            keep_count: 保留的消息数量
-            archive_all: 是否归档所有消息
-            is_rag_mode: 是否是 RAG 模式（需要更新 RAG 索引）
+            query: Search query
+            type_filter: Optional memory type filter
+            top_k: Number of results to return
 
         Returns:
-            True 成功，False 失败
+            List of MemorySearchResult sorted by BM25 score
         """
-        # 1. Always append history
-        modified_files = set()
-        if entry := args.get("history_entry"):
-            if not isinstance(entry, str):
-                entry = json.dumps(entry, ensure_ascii=False)
-            self.append_history(entry)
-            logger.debug("History entry appended: {}", entry[:100])
+        if not query.strip():
+            return []
 
-        # 2. Apply incremental operations atomically
-        logger.debug("Applying {} memory operations", len(operations))
+        try:
+            # Sanitize query for FTS5
+            safe_query = self._sanitize_fts_query(query)
+            if not safe_query:
+                return []
 
-        for i, op in enumerate(operations):
-            op_file = op.get("file", "unknown")
-            op_action = op.get("action", "unknown")
-            op_content = op.get("content", "")
-            content_preview = (op_content or "")[:50] if op_content else ""
-            logger.debug("Operation {}/{}: file={}, action={}, content_preview={}",
-                        i + 1, len(operations), op_file, op_action, content_preview)
-            if op_action != "skip":
-                modified_files.add(op_file)
+            conn = self._db._conn
 
-        if not self.apply_operations_atomic(operations):
-            logger.warning("Memory consolidation: operations failed")
+            if type_filter:
+                # Join with memories table to filter by type
+                sql = """
+                    SELECT
+                        m.id,
+                        m.type,
+                        m.detail,
+                        m.at_time,
+                        m.read_times,
+                        m.last_read_time,
+                        bm25(memories_fts) as score
+                    FROM memories_fts
+                    JOIN memories m ON memories_fts.rowid = m.id
+                    WHERE memories_fts MATCH ?
+                      AND m.type = ?
+                      AND m.deleted_at IS NULL
+                    ORDER BY bm25(memories_fts)
+                    LIMIT ?
+                """
+                cursor = conn.execute(sql, (safe_query, type_filter, top_k))
+            else:
+                sql = """
+                    SELECT
+                        m.id,
+                        m.type,
+                        m.detail,
+                        m.at_time,
+                        m.read_times,
+                        m.last_read_time,
+                        bm25(memories_fts) as score
+                    FROM memories_fts
+                    JOIN memories m ON memories_fts.rowid = m.id
+                    WHERE memories_fts MATCH ?
+                      AND m.deleted_at IS NULL
+                    ORDER BY bm25(memories_fts)
+                    LIMIT ?
+                """
+                cursor = conn.execute(sql, (safe_query, top_k))
+
+            results = []
+            rows = cursor.fetchall()
+            if rows:
+                # Min-Max normalization for BM25 scores (lower BM25 = better)
+                bm25_scores = [row[6] for row in rows if row[6] is not None]
+                if bm25_scores:
+                    min_bm25 = min(bm25_scores)
+                    max_bm25 = max(bm25_scores)
+
+                    for row in rows:
+                        bm25_score = row[6] if row[6] is not None else 1.0
+                        if max_bm25 == min_bm25:
+                            normalized = 1.0
+                        else:
+                            # Invert because BM25: lower = better
+                            normalized = 1.0 - (bm25_score - min_bm25) / (max_bm25 - min_bm25)
+
+                        results.append(MemorySearchResult(
+                            id=row[0],
+                            type=row[1],
+                            detail=row[2],
+                            at_time=row[3],
+                            read_times=row[4],
+                            last_read_time=row[5] if row[5] else row[3],
+                            model_score=normalized,
+                            source="bm25",
+                        ))
+
+            logger.debug("[MemoryStore] BM25 search: query='{}', results={}", query[:50], len(results))
+            return results
+
+        except Exception as e:
+            logger.warning("[MemoryStore] BM25 search failed: {}", e)
+            return []
+
+    async def _vector_search(self, query: str, type_filter: Optional[str] = None, top_k: int = VECTOR_TOP_K) -> list[MemorySearchResult]:
+        """
+        Perform vector similarity search on memories.
+
+        Args:
+            query: Search query
+            type_filter: Optional memory type filter
+            top_k: Number of results to return
+
+        Returns:
+            List of MemorySearchResult sorted by similarity
+        """
+        if not self._vec_enabled or self._embedding_provider is None:
+            return []
+
+        try:
+            import sqlite_vec
+
+            # Generate query embedding
+            query_embedding = await self._embedding_provider.embed(query)
+            embedding_blob = sqlite_vec.serialize_float32(query_embedding)
+
+            conn = self._db._conn
+
+            if type_filter:
+                sql = """
+                    SELECT
+                        m.id,
+                        m.type,
+                        m.detail,
+                        m.at_time,
+                        m.read_times,
+                        m.last_read_time,
+                        e.distance
+                    FROM memory_embeddings e
+                    JOIN memories m ON e.memory_id = m.id
+                    WHERE e.embedding MATCH ?
+                      AND e.k = ?
+                      AND m.type = ?
+                      AND m.deleted_at IS NULL
+                """
+                cursor = conn.execute(sql, (embedding_blob, top_k, type_filter))
+            else:
+                sql = """
+                    SELECT
+                        m.id,
+                        m.type,
+                        m.detail,
+                        m.at_time,
+                        m.read_times,
+                        m.last_read_time,
+                        e.distance
+                    FROM memory_embeddings e
+                    JOIN memories m ON e.memory_id = m.id
+                    WHERE e.embedding MATCH ?
+                      AND e.k = ?
+                      AND m.deleted_at IS NULL
+                """
+                cursor = conn.execute(sql, (embedding_blob, top_k))
+
+            results = []
+            for row in cursor:
+                distance = row[6] if row[6] is not None else 1.0
+                similarity = max(0.0, min(1.0, 1.0 - (distance / 2.0)))
+
+                results.append(MemorySearchResult(
+                    id=row[0],
+                    type=row[1],
+                    detail=row[2],
+                    at_time=row[3],
+                    read_times=row[4],
+                    last_read_time=row[5] if row[5] else row[3],
+                    model_score=similarity,
+                    source="vector",
+                ))
+
+            logger.debug("[MemoryStore] Vector search: query='{}', results={}", query[:50], len(results))
+            return results
+
+        except Exception as e:
+            logger.warning("[MemoryStore] Vector search failed: {}", e)
+            return []
+
+    def _rrf_fusion(self, bm25_results: list[MemorySearchResult], vector_results: list[MemorySearchResult], k: int = 60) -> list[MemorySearchResult]:
+        """
+        Perform Reciprocal Rank Fusion (RRF) on BM25 and vector results.
+
+        Args:
+            bm25_results: BM25 search results
+            vector_results: Vector search results
+            k: RRF smoothing parameter
+
+        Returns:
+            Fused and deduplicated results
+        """
+        seen = {}
+        fused: list[MemorySearchResult] = []
+
+        # Process BM25 results first (higher priority)
+        for rank, result in enumerate(bm25_results):
+            if result.id not in seen:
+                rrf_score = 1.0 / (k + rank + 1)
+                result.model_score = rrf_score
+                result.source = "bm25"
+                seen[result.id] = result
+                fused.append(result)
+
+        # Add vector results not in BM25
+        for rank, result in enumerate(vector_results):
+            if result.id not in seen:
+                rrf_score = 1.0 / (k + rank + 1)
+                result.model_score = rrf_score
+                result.source = "vector"
+                seen[result.id] = result
+                fused.append(result)
+
+        # Sort by RRF score
+        fused.sort(key=lambda x: x.model_score, reverse=True)
+
+        return fused
+
+    async def _rerank_with_cross_encoder(self, query: str, candidates: list[MemorySearchResult], top_k: int = RERANK_TOP_K) -> list[MemorySearchResult]:
+        """
+        Rerank candidates using CrossEncoder.
+
+        Args:
+            query: Search query
+            candidates: Candidate results to rerank
+            top_k: Number of results to return after reranking
+
+        Returns:
+            Reranked results
+        """
+        if not candidates:
+            return []
+
+        try:
+            # Prepare candidate texts
+            candidate_texts = [c.detail for c in candidates]
+
+            # Get reranked indices with scores
+            reranked = await self._reranker.rerank(query, candidate_texts)
+
+            if not reranked:
+                return candidates[:top_k]
+
+            # Map back to MemorySearchResult with cross-encoder scores
+            reranked_results = []
+            for idx, ce_score in reranked[:top_k]:
+                result = candidates[idx]
+                result.model_score = ce_score
+                reranked_results.append(result)
+
+            logger.debug("[MemoryStore] CrossEncoder rerank: {} -> {}", len(candidates), len(reranked_results))
+            return reranked_results
+
+        except Exception as e:
+            logger.warning("[MemoryStore] CrossEncoder rerank failed: {}", e)
+            return candidates[:top_k]
+
+    def _calculate_final_score(self, result: MemorySearchResult) -> float:
+        """
+        Calculate comprehensive final score.
+
+        Formula: final = model_score * 0.7 + freq_score * 0.2 + recency_score * 0.1
+
+        Args:
+            result: MemorySearchResult with model_score
+
+        Returns:
+            Final comprehensive score
+        """
+        # Frequency score: log normalization
+        freq_score = math.log(1 + result.read_times) / math.log(1 + MAX_READ_TIMES)
+
+        # Recency score: exponential decay
+        days_since = (time.time() - result.last_read_time) / 86400
+        recency_score = math.exp(-RECENCY_DECAY_LAMBDA * days_since)
+
+        # Weighted sum
+        final_score = (
+            result.model_score * MODEL_SCORE_WEIGHT +
+            freq_score * FREQ_SCORE_WEIGHT +
+            recency_score * RECENCY_SCORE_WEIGHT
+        )
+
+        return final_score
+
+    async def search(
+        self,
+        query: str,
+        type: Optional[MemoryType] = None,
+        top_k: int = 5,
+    ) -> list[dict]:
+        """
+        Hybrid search for memories.
+
+        Flow: Query -> BM25 search -> Vector search -> RRF fusion -> CrossEncoder rerank -> 综合打分 -> Top-K
+
+        Args:
+            query: Search query
+            type: Optional memory type filter
+            top_k: Number of results to return
+
+        Returns:
+            List of memory dicts sorted by comprehensive score
+        """
+        if not query.strip():
+            return []
+
+        type_filter = type.value if type else None
+
+        # Step 1: BM25 search
+        bm25_start = time.perf_counter()
+        bm25_results = await self._bm25_search(query, type_filter, RECALL_TOP_K)
+        bm25_elapsed = (time.perf_counter() - bm25_start) * 1000
+
+        # Step 2: Vector search
+        vector_start = time.perf_counter()
+        vector_results = await self._vector_search(query, type_filter, RECALL_TOP_K)
+        vector_elapsed = (time.perf_counter() - vector_start) * 1000
+
+        # Step 3: RRF fusion
+        fusion_start = time.perf_counter()
+        fused_results = self._rrf_fusion(bm25_results, vector_results)
+        fusion_elapsed = (time.perf_counter() - fusion_start) * 1000
+
+        # If no vector results, fall back to BM25-only
+        if not vector_results:
+            fused_results = bm25_results[:top_k]
+
+        # Step 4: CrossEncoder reranking (on top candidates)
+        rerank_start = time.perf_counter()
+        reranked_results = await self._rerank_with_cross_encoder(query, fused_results, RERANK_TOP_K)
+        rerank_elapsed = (time.perf_counter() - rerank_start) * 1000
+
+        # Step 5: Calculate final scores and sort
+        for result in reranked_results:
+            result.final_score = self._calculate_final_score(result)
+
+        reranked_results.sort(key=lambda x: x.final_score, reverse=True)
+
+        # Step 6: Take top-k and update read stats
+        final_results = reranked_results[:top_k]
+
+        # Update read statistics (direct sync call in same thread)
+        for result in final_results:
+            self._db.update_read_stats(result.id)
+
+        logger.info(
+            "[MemoryStore] Search: query='{}', bm25={}ms, vec={}ms, fusion={}ms, rerank={}ms, final={}",
+            query[:50], bm25_elapsed, vector_elapsed, fusion_elapsed, rerank_elapsed, len(final_results)
+        )
+
+        return [
+            {
+                "id": r.id,
+                "type": r.type,
+                "detail": r.detail,
+                "at_time": r.at_time,
+                "read_times": r.read_times,
+                "last_read_time": r.last_read_time,
+                "score": r.final_score,
+            }
+            for r in final_results
+        ]
+
+    async def insert(self, type: MemoryType, detail: str, at_time: Optional[int] = None, read_times: int = 0) -> int:
+        """
+        Insert a new memory.
+
+        Args:
+            type: Memory type
+            detail: Memory content (Markdown format)
+            at_time: Optional associated timestamp (defaults to now)
+            read_times: Initial read times (default 0)
+
+        Returns:
+            Generated memory id (INTEGER)
+        """
+        if at_time is None:
+            at_time = int(time.time())
+
+        memory_id = self._db.insert(type.value, detail, at_time, read_times)
+
+        # Store vector embedding if enabled
+        if self._vec_enabled and self._embedding_provider:
+            try:
+                import sqlite_vec
+                embedding = await self._embedding_provider.embed(detail)
+                embedding_blob = sqlite_vec.serialize_float32(embedding)
+
+                conn = self._db._conn
+                conn.execute(
+                    "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding) VALUES (?, ?)",
+                    (memory_id, embedding_blob)
+                )
+                conn.commit()
+            except Exception as e:
+                logger.warning("[MemoryStore] Failed to store vector embedding: {}", e)
+
+        logger.debug("[MemoryStore] Inserted memory: id={}, type={}", memory_id, type.value)
+        return memory_id
+
+    async def update(self, id: int, detail: str, at_time: int) -> bool:
+        """
+        Update a memory.
+
+        Args:
+            id: Memory id
+            detail: New memory content
+            at_time: New associated timestamp
+
+        Returns:
+            True if updated, False if not found
+        """
+        # Get old detail for FTS sync before update
+        conn = self._db._conn
+        cursor = conn.execute("SELECT detail FROM memories WHERE id = ? AND deleted_at IS NULL", (id,))
+        row = cursor.fetchone()
+        if not row:
             return False
 
-        # 3. 更新 RAG 索引（只索引修改的文件，仅 RAG 模式）
-        rag_update_failed = False
-        if is_rag_mode and modified_files and self._rag_store:
-            for file_name in modified_files:
-                if file_name in self.MEMORY_FILES:
-                    target_memory_file = self.MEMORY_FILES[file_name]
-                    if not self._rag_store.config.enable_memory_index:
-                        logger.debug("Memory index update skipped (enable_memory_index=False)")
-                    else:
-                        try:
-                            file_path = self.memory_dir / target_memory_file.value
-                            await self._rag_store.index_single_file(
-                                file_path,
-                                min_chunk_size=self._rag_store.config.memory_chunk_size // 2,
-                                max_chunk_size=self._rag_store.config.memory_chunk_size,
-                                chunk_overlap_ratio=self._rag_store.config.memory_chunk_overlap_ratio,
-                            )
-                            logger.info("RAG memory index updated for: {}", target_memory_file.value)
-                        except Exception as e:
-                            logger.warning("RAG memory index update failed: {}", e)
-                            rag_update_failed = True  # 标记失败
-
-        # 4. 更新 session 状态（仅当 RAG 更新成功时）
-        if not is_rag_mode or not rag_update_failed:
-            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
-            logger.info(
-                "Memory consolidation completed: operations={}, modified_files={}, last_consolidated={}",
-                len(operations), len(modified_files), session.last_consolidated,
-            )
-        else:
-            logger.warning(
-                "Memory consolidation completed but RAG index update failed, "
-                "last_consolidated not updated (will retry next time)"
-            )
-        return True
-
-    async def consolidate(
-        self,
-        session: Session,
-        provider: LLMProvider,
-        model: str,
-        *,
-        archive_all: bool = False,
-        memory_window: int = 50,
-        use_rag: bool = True,
-    ) -> bool:
+        old_detail = row[0]
+        now = self._db._now()
+        sql = """
+        UPDATE memories
+        SET detail = ?, at_time = ?, updated_at = ?
+        WHERE id = ? AND deleted_at IS NULL
         """
-        Consolidate memory with incremental operations.
+        cursor = conn.execute(sql, (detail, at_time, now, id))
+        conn.commit()
+        updated = cursor.rowcount > 0
 
-        Two strategies available:
-        - **RAG-based** (use_rag=True): RAG search → LLM with save_memory tool.
-          More accurate for avoiding duplicates and maintaining consistency.
-        - **Direct** (use_rag=False): LLM directly decides operations.
-          Faster but may create duplicates.
+        if updated:
+            # Sync FTS: mark old as deleted, insert new
+            conn.execute("INSERT INTO memories_fts(memories_fts, rowid, detail) VALUES('delete', ?, ?)", (id, old_detail))
+            conn.execute("INSERT INTO memories_fts(rowid, detail) VALUES (?, ?)", (id, detail))
+            conn.commit()
+
+        # Update vector embedding if enabled
+        if updated and self._vec_enabled and self._embedding_provider:
+            try:
+                import sqlite_vec
+                embedding = await self._embedding_provider.embed(detail)
+                embedding_blob = sqlite_vec.serialize_float32(embedding)
+
+                conn = self._db._conn
+                conn.execute(
+                    "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding) VALUES (?, ?)",
+                    (id, embedding_blob)
+                )
+                conn.commit()
+            except Exception as e:
+                logger.warning("[MemoryStore] Failed to update vector embedding: {}", e)
+
+        if updated:
+            logger.debug("[MemoryStore] Updated memory: id={}", id)
+        return updated
+
+    async def delete(self, id: int) -> bool:
+        """
+        Soft delete a memory.
 
         Args:
-            session: Session to consolidate
-            provider: LLM provider
-            model: Model to use
-            archive_all: If True, archive all messages (default: keep recent half)
-            memory_window: Number of recent messages to keep
-            use_rag: If True, use RAG-based consolidation (requires _rag_store)
+            id: Memory id
+
+        Returns:
+            True if deleted, False if not found
+        """
+        deleted = self._db.soft_delete(id)
+        if deleted:
+            logger.debug("[MemoryStore] Soft deleted memory: id={}", id)
+        return deleted
+
+    async def consolidate(self, session: "Session", provider: "LLMProvider", model: str, **kwargs) -> bool:
+        """
+        Consolidate memory from session using 2-step flow.
+
+        Step 1: Extract memories (1 LLM call)
+        Step 2: Process by type:
+          - HISTORY -> INSERT
+          - KNOWLEDGE/DECISIONS/PROJECTS -> search -> INSERT/UPDATE
+
+        Args:
+            session: Session with messages to consolidate
+            provider: LLM provider for extraction
+            model: Model name for extraction
 
         Returns:
             True on success, False on failure
         """
-        # Choose consolidation strategy
-        if use_rag and self._rag_store is not None:
-            return await self._consolidate_with_rag(
-                session, provider, model,
-                archive_all=archive_all, memory_window=memory_window,
-            )
-        else:
-            if use_rag and self._rag_store is None:
-                logger.warning("RAG-based consolidation requested but _rag_store is None, falling back to direct method")
-            return await self._consolidate_direct(
-                session, provider, model,
-                archive_all=archive_all, memory_window=memory_window,
+        try:
+
+            # Get messages since last consolidation
+            messages = session.messages[session.last_consolidated:]
+            if not messages:
+                return True
+
+            # Build conversation text from all unconsolidated messages
+            conversation = self._build_conversation_text(messages)
+
+            # Step 1: Extract memories with LLM
+            extraction_start = time.perf_counter()
+            extracted = await self._extract_memories(conversation, provider, model)
+            extraction_elapsed = (time.perf_counter() - extraction_start) * 1000
+
+            if not extracted:
+                logger.info("[MemoryStore] No memories extracted from session")
+                return True
+
+            logger.info(
+                "[MemoryStore] Extracted memories: history={}, knowledge={}, decisions={}, projects={}, elapsed={}ms",
+                len(extracted.get("history", [])), len(extracted.get("knowledge", [])),
+                len(extracted.get("decisions", [])), len(extracted.get("projects", [])),
+                extraction_elapsed
             )
 
-    async def _call_save_memory_with_retry(
-        self,
-        prompt: str,
-        provider: LLMProvider,
-        model: str,
-        base_system_prompt: str = "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
-    ) -> tuple[dict, list[dict]] | None:
+            # Step 2: Process by type
+            process_start = time.perf_counter()
+
+            # 2.1 HISTORY - direct INSERT
+            if extracted.get("history"):
+                history_text = extracted["history"]
+                if isinstance(history_text, list):
+                    history_text = "\n".join(history_text)
+                await self.insert(MemoryType.HISTORY, history_text)
+
+            # 2.2 KNOWLEDGE - search then INSERT or UPDATE
+            for knowledge in extracted.get("knowledge", []):
+                if isinstance(knowledge, dict):
+                    content = knowledge.get("content", str(knowledge))
+                    title = knowledge.get("title", "")
+                    if title:
+                        content = f"## {title}\n\n{content}"
+                else:
+                    content = str(knowledge)
+
+                related = await self.search(content, type=MemoryType.KNOWLEDGE, top_k=3)
+                if not related:
+                    await self.insert(MemoryType.KNOWLEDGE, content)
+                else:
+                    integrated = await self._integrate_memories(
+                        [r["detail"] for r in related],
+                        content,
+                        MemoryType.KNOWLEDGE,
+                        provider, model
+                    )
+                    # Soft delete old and insert new
+                    for r in related:
+                        await self.delete(r["id"])
+                    await self.insert(MemoryType.KNOWLEDGE, integrated, read_times=10)
+
+            # 2.3 DECISIONS - search then INSERT or UPDATE
+            for decision in extracted.get("decisions", []):
+                if isinstance(decision, dict):
+                    content = self._format_decision(decision)
+                else:
+                    content = str(decision)
+
+                related = await self.search(content, type=MemoryType.DECISIONS, top_k=3)
+                if not related:
+                    await self.insert(MemoryType.DECISIONS, content)
+                else:
+                    integrated = await self._integrate_memories(
+                        [r["detail"] for r in related],
+                        content,
+                        MemoryType.DECISIONS,
+                        provider, model
+                    )
+                    for r in related:
+                        await self.delete(r["id"])
+                    await self.insert(MemoryType.DECISIONS, integrated, read_times=10)
+
+            # 2.4 PROJECTS - search then INSERT or UPDATE
+            for project in extracted.get("projects", []):
+                if isinstance(project, dict):
+                    content = self._format_project(project)
+                else:
+                    content = str(project)
+
+                related = await self.search(content, type=MemoryType.PROJECTS, top_k=3)
+                if not related:
+                    await self.insert(MemoryType.PROJECTS, content)
+                else:
+                    integrated = await self._integrate_memories(
+                        [r["detail"] for r in related],
+                        content,
+                        MemoryType.PROJECTS,
+                        provider, model
+                    )
+                    for r in related:
+                        await self.delete(r["id"])
+                    await self.insert(MemoryType.PROJECTS, integrated, read_times=10)
+
+            # 2.5 PROFILE - LLM 整合后覆盖写文件
+            if extracted.get("profile_updates"):
+                profile_updates = extracted["profile_updates"]
+                if isinstance(profile_updates, list):
+                    updates_text = "\n".join(
+                        u.get("content", str(u)) if isinstance(u, dict) else str(u)
+                        for u in profile_updates
+                    )
+                else:
+                    updates_text = str(profile_updates)
+
+                # 读取原 PROFILE.md
+                profile_path = self._workspace / "memory" / "PROFILE.md"
+                original_profile = ""
+                if profile_path.exists():
+                    original_profile = profile_path.read_text(encoding="utf-8")
+
+                # LLM 整合
+                new_profile = await self._integrate_profile(original_profile, updates_text, provider, model)
+
+                # 覆盖写
+                profile_path.parent.mkdir(parents=True, exist_ok=True)
+                profile_path.write_text(new_profile, encoding="utf-8")
+                logger.info("[MemoryStore] PROFILE.md updated")
+
+            process_elapsed = (time.perf_counter() - process_start) * 1000
+            logger.info("[MemoryStore] Consolidation complete: process={}ms", process_elapsed)
+
+            # Update session to mark messages as consolidated
+            session.last_consolidated = len(session.messages)
+
+            return True
+
+        except Exception as e:
+            logger.error("[MemoryStore] Consolidation failed: {}", e)
+            return False
+
+    async def _extract_memories(self, conversation: str, provider: "LLMProvider", model: str) -> dict:
         """
-        Call LLM with save_memory tool with retry logic.
+        Extract memories from conversation using LLM.
 
         Args:
-            prompt: The user prompt to send
+            conversation: Conversation text
             provider: LLM provider
-            model: Model to use
-            base_system_prompt: Base system prompt (will be modified for retries)
+            model: Model name
 
         Returns:
-            (args, operations) or None if failed after all retries
+            Extracted memories dict
         """
-        # Initial call
-        response = await provider.chat(
-            messages=[
-                {"role": "system", "content": base_system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            tools=_SAVE_MEMORY_TOOL,
-            model=model,
-        )
+        prompt = f"""你是一个记忆提取系统。从以下对话中提取结构化记忆。
 
-        logger.debug("LLM response: tool_calls={}, finish_reason={}, has_content={}",
-                   len(response.tool_calls), response.finish_reason, response.content is not None)
+## 记忆类型
 
-        result = self._process_save_memory_tool_call(response)
-        if result is not None:
-            return result
+1. **HISTORY** - 事件日志：简单的时间线记录
+2. **KNOWLEDGE** - 知识/经验：可包含来源
+3. **DECISIONS** - 决策记录：场景、决定、结果
+4. **PROJECTS** - 项目知识：项目信息、任务进度
+5. **PROFILE** - 用户画像更新：用户偏好、研究方向等变化
 
-        # Retry logic
-        for retry_attempt in range(2):
-            logger.warning(
-                "Memory consolidation: no save_memory tool call, retrying (attempt {}/2)...",
-                retry_attempt + 1,
-            )
-            retry_prompt = self._add_retry_instruction(prompt, retry_attempt + 1)
-            retry_system_prompt = "You are a memory consolidation assistant. Use the save_memory tool."
+## 格式要求
+
+请以JSON格式返回，包含以下字段：
+- history: 字符串，历史事件摘要（如果有）
+- knowledge: 数组，知识条目列表（每个包含content字段）
+- decisions: 数组，决策列表（每个包含scenario, decision, result字段）
+- projects: 数组，项目列表（每个包含name, progress, tasks字段）
+- profile_updates: 数组，用户画像更新内容列表（每个包含content字段）
+
+## 重要：简洁要求
+
+每个提取的记忆条目都要简洁，每个 content/摘要 控制在 300 字符以内，突出核心要点，不要冗余。
+
+## 对话内容
+
+{conversation}
+
+## 输出
+
+请直接返回JSON，不要包含其他文字。
+"""
+
+        try:
             response = await provider.chat(
-                messages=[
-                    {"role": "system", "content": retry_system_prompt},
-                    {"role": "user", "content": retry_prompt},
-                ],
-                tools=_SAVE_MEMORY_TOOL,
+                messages=[{"role": "user", "content": prompt}],
                 model=model,
-            )
-            result = self._process_save_memory_tool_call(response)
-            if result is not None:
-                logger.info("Memory consolidation succeeded on retry {}", retry_attempt + 1)
-                return result
-
-        logger.error("Memory consolidation failed after 3 attempts (1 initial + 2 retries)")
-        return None
-
-    async def _consolidate_direct(
-        self,
-        session: Session,
-        provider: LLMProvider,
-        model: str,
-        *,
-        archive_all: bool = False,
-        memory_window: int = 50,
-    ) -> bool:
-        """Direct consolidation: LLM directly decides operations without RAG search."""
-        # Step 1: 获取要固化的消息（复用共享逻辑）
-        old_messages, keep_count = self._get_messages_to_consolidate(
-            session, archive_all, memory_window
-        )
-        if not old_messages:
-            return True
-
-        lines = []
-        for m in old_messages:
-            if not m.get("content"):
-                continue
-            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(
-                f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}"
+                temperature=0.3,
             )
 
-        prompt = f"""IMPORTANT: You MUST call the save_memory tool with your consolidation.
-Do NOT just describe the changes in your response - actually call the tool.
-If there is nothing worth saving, call the tool with empty operations.
+            content = response.content if hasattr(response, "content") else str(response)
 
-{MEMORY_FILES_DESC}
+            # Parse JSON from response
+            json_match = re.search(r'\{[\s\S]*\}', content)
+            if json_match:
+                import json
+                return json.loads(json_match.group())
 
-## Current Memory State
-{self._get_memory_summary()}
-
-## Conversation to Process
-{chr(10).join(lines)}"""
-
-        try:
-            logger.debug("Calling LLM for memory consolidation: model={}, messages={}, prompt_len={}",
-                       model, len(old_messages), len(prompt))
-
-            result = await self._call_save_memory_with_retry(
-                prompt, provider, model,
-                base_system_prompt="You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."
-            )
-            if result is None:
-                return False
-            args, operations = result
-
-            # 复用共享的 apply 操作逻辑
-            return await self._apply_save_memory_operations(
-                args, operations, session, keep_count, archive_all, is_rag_mode=False
-            )
-        except Exception:
-            logger.exception("Memory consolidation failed with exception")
-            return False
-
-    async def _search_related_memory_enhanced(
-        self,
-        messages: list[dict],
-        top_k: int = 3,
-    ) -> tuple[list[str], str]:
-        """
-        增强的 RAG 搜索：
-        1. 格式化消息
-        2. 用完整消息搜索（信息更全）
-        3. 返回相关记忆 + 格式化后的消息
-
-        Returns:
-            (related_memory, formatted_messages): 相关记忆列表，格式化后的消息
-        """
-        if not self._rag_store:
-            return [], ""
-
-        # 格式化消息用于搜索和 LLM
-        formatted = self._format_messages(messages)
-
-        # 用完整消息搜索（不压缩，信息更全）
-        try:
-            results = await self._rag_store.search_advanced(formatted, top_k=top_k)
-            memory_path = self.memory_dir.resolve()
-
-            memory_results = []
-            for r in results:
-                doc_path = Path(r.document.path).resolve()
-                if doc_path == memory_path or memory_path in doc_path.parents:
-                    memory_results.append(r.combined_content)
-
-            return memory_results, formatted
+            return {}
         except Exception as e:
-            logger.warning("Memory search failed: {}", e)
-            return [], formatted
+            logger.warning("[MemoryStore] Memory extraction failed: {}", e)
+            return {}
 
-    async def _consolidate_with_rag(
+    async def _integrate_memories(
         self,
-        session: "Session",
+        old_memories: list[str],
+        new_memory: str,
+        memory_type: MemoryType,
         provider: "LLMProvider",
         model: str,
-        *,
-        archive_all: bool = False,
-        memory_window: int = 50,
-    ) -> bool:
+    ) -> str:
         """
-        优化后的 RAG-based consolidation：
-        1. 获取要固化的消息
-        2. RAG 搜索相关记忆
-        3. LLM 单次调用，直接用 save_memory tool
+        Integrate old memories with new memory using LLM.
 
-        优势：
-        - 1 次 LLM 调用（之前 2 次）
-        - 支持 update_section
-        - 支持多文件操作
-        - 代码更简洁
+        Args:
+            old_memories: List of existing memory contents
+            new_memory: New memory content to integrate
+            memory_type: Type of memory
+            provider: LLM provider
+            model: Model name
+
+        Returns:
+            Integrated memory content
         """
-        # Step 1: 获取要固化的消息
-        old_messages, keep_count = self._get_messages_to_consolidate(
-            session, archive_all, memory_window
-        )
-        if not old_messages:
-            return True
+        prompt = f"""你是一个记忆整合系统。将新的记忆与已有的相关记忆整合。
+
+## 记忆类型
+{memory_type.value}
+
+## 已有关联记忆
+{chr(10).join(f'- {m}' for m in old_memories)}
+
+## 新记忆
+{new_memory}
+
+## 任务
+整合以上记忆，生成一个新的、更完整的记忆。保留所有重要信息，去除重复。
+
+请直接返回整合后的记忆内容，不要包含解释。
+"""
 
         try:
-            # Step 2: RAG 搜索相关记忆
-            logger.debug("Step 2: Searching for related memories")
-            related_memory, formatted_messages = await self._search_related_memory_enhanced(
-                old_messages, top_k=3
-            )
-            logger.debug("Found {} related memories", len(related_memory))
-
-            # Step 3: 构建带相关记忆的 prompt，单次 LLM 调用
-            logger.debug("Step 3: Calling LLM with save_memory tool")
-
-            memory_context = "\n\n---\n\n".join([
-                f"[Related Memory {i+1}]\n{m}"
-                for i, m in enumerate(related_memory)
-            ]) if related_memory else "(No related memories)"
-
-            prompt = f"""IMPORTANT: You MUST call the save_memory tool.
-Do NOT just describe changes - actually call the tool.
-
-{MEMORY_FILES_DESC}
-
-## Current Memory State
-{self._get_memory_summary()}
-
-## Related Memories (from RAG search)
-{memory_context}
-
-## Conversation to Process
-{formatted_messages}
-
-Important: Use the related memories to avoid duplication and ensure consistency.
-You can use update_section for granular updates, and multiple operations if needed."""
-
-            logger.debug("Calling LLM for RAG memory consolidation: model={}, prompt_len={}",
-                       model, len(prompt))
-
-            # Step 4: 处理 tool call with retry
-            result = await self._call_save_memory_with_retry(
-                prompt, provider, model,
-                base_system_prompt="You are a memory consolidation assistant. Use the save_memory tool with the conversation and related memories."
-            )
-            if result is None:
-                return False
-            args, operations = result
-
-            # Step 5: 应用操作
-            return await self._apply_save_memory_operations(
-                args, operations, session, keep_count, archive_all, is_rag_mode=True
+            response = await provider.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+                temperature=0.3,
             )
 
-        except Exception:
-            logger.exception("Memory consolidation failed with exception")
-            return False
+            return response.content if hasattr(response, "content") else str(response)
+        except Exception as e:
+            logger.warning("[MemoryStore] Memory integration failed: {}", e)
+            return new_memory
 
-    def _add_retry_instruction(self, original_prompt: str, retry_count: int) -> str:
-        """Add retry instruction to prompt."""
-        if retry_count == 1:
-            retry_instruction = """
-IMPORTANT: You MUST call the save_memory tool with your consolidation.
-Do not just describe the changes in your response - actually call the tool.
+    def _format_decision(self, decision: dict) -> str:
+        """Format decision dict as Markdown."""
+        scenario = decision.get("scenario", "")
+        dec = decision.get("decision", "")
+        result = decision.get("result", "")
+        lesson = decision.get("lesson", "")
+
+        content = f"## 场景\n{scenario}\n\n## 决定\n{dec}\n\n## 结果\n{result}"
+        if lesson:
+            content += f"\n\n## 教训\n{lesson}"
+        return content
+
+    def _format_project(self, project: dict) -> str:
+        """Format project dict as Markdown."""
+        name = project.get("name", "")
+        overview = project.get("overview", "")
+        progress = project.get("progress", "")
+        tasks = project.get("tasks", [])
+
+        content = f"## {name}\n\n### 概述\n{overview}\n\n### 当前阶段\n{progress}\n\n### 任务进度"
+        if tasks:
+            for task in tasks:
+                if isinstance(task, dict):
+                    done = "x" if task.get("done") else " "
+                    content += f"\n- [{done}] {task.get('name', '')}"
+                else:
+                    content += f"\n- [ ] {task}"
+        return content
+
+    async def _integrate_profile(
+        self,
+        original: str,
+        updates: str,
+        provider: "LLMProvider",
+        model: str,
+    ) -> str:
+        """
+        Integrate profile updates with original profile.
+
+        Args:
+            original: Original PROFILE.md content
+            updates: New profile updates text
+            provider: LLM provider
+            model: Model name
+
+        Returns:
+            Integrated profile content
+        """
+        prompt = f"""你是一个用户画像整合系统。将新的用户画像更新与原始画像整合。
+
+## 原始用户画像
+{original if original else "(空)"}
+
+## 新的更新内容
+{updates}
+
+## 任务
+1. 理解原始用户画像的结构
+2. 将新的更新内容融入其中
+3. 生成更新后的完整用户画像
+4. 保留原有的合理内容
+5. 如果更新内容与原内容冲突，以新的为准
+
+请直接返回整合后的用户画像内容（Markdown 格式），不要包含解释。
 """
-        else:  # retry_count == 2
-            retry_instruction = """
-CRITICAL: This is your second retry. You MUST call the save_memory tool.
-If you cannot identify any memory-worthy content, call the tool with empty operations.
-DO NOT respond without calling the tool.
-"""
-        return retry_instruction + "\n\n" + original_prompt
 
-    def _format_messages(self, messages: list[dict]) -> str:
-        """Format messages for LLM processing."""
-        lines = []
-        for m in messages:
-            if not m.get("content"):
-                continue
-            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
-        return "\n".join(lines)
+        try:
+            response = await provider.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+                temperature=0.3,
+            )
+            return response.content if hasattr(response, "content") else str(response)
+        except Exception as e:
+            logger.warning("[MemoryStore] Profile integration failed: {}", e)
+            # Fallback: append updates to original
+            return f"{original}\n\n---\n\n## 更新\n{updates}"
+
+    def _build_conversation_text(self, messages: list[dict]) -> str:
+        """Build conversation text from messages."""
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if content:
+                parts.append(f"{role}: {content}")
+        return "\n".join(parts)
+
+    def get_memory_context(self) -> str:
+        """
+        Get PROFILE.md content for prompt.
+
+        Returns:
+            PROFILE.md file content, or empty string if not found.
+        """
+        profile_path = self._workspace / "memory" / "PROFILE.md"
+        if profile_path.exists():
+            return profile_path.read_text(encoding="utf-8")
+        return ""
+
+    @staticmethod
+    def _sanitize_fts_query(query: str) -> str:
+        """Sanitize query for FTS5 simple phrase search."""
+        # Replace anything that's not a letter, number, or Chinese with space
+        sanitized = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff]', ' ', query)
+        # Normalize multiple spaces to single space
+        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+
+        if not sanitized:
+            return ""
+
+        # Return as a single quoted phrase
+        return f'"{sanitized}"'
+
+    @property
+    def connection(self):
+        """Public access to database connection."""
+        return self._db.connection
+
+    def close(self) -> None:
+        """Close database connections."""
+        self._db.close()
+        logger.debug("[MemoryStore] Closed")
+
+    def __enter__(self) -> "MemoryStore":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()

@@ -6,68 +6,21 @@ always: true
 
 # Memory
 
-## Structure
+## 记忆类型
 
-```
-memory/
-├── PROFILE.md     # User profile (research direction, preferences). Stable.
-├── PROJECTS.md    # Project knowledge (tech stack, architecture). Semi-stable.
-├── PAPERS.md      # Paper notes (papers read, key findings). Incremental.
-├── DECISIONS.md   # Decision records (why A over B). Incremental.
-└── HISTORY.md     # Append-only event log. NOT loaded into context.
-```
+| 类型 | 用途 |
+|------|------|
+| HISTORY | 记录发生的事件、讨论、动作 |
+| KNOWLEDGE | 学到的知识、论文笔记、研究发现 |
+| DECISIONS | 做过的决定及原因 |
+| PROJECTS | 项目进度、任务、技术方案 |
 
-## Selective Loading
+## 工具
 
-Memory files are loaded selectively based on context:
+当问题涉及过往事件、知识、决定或项目时，使用 search_memory 工具搜索相关记忆：
 
-- **Always loaded**: PROFILE.md
-- **Keyword-triggered**:
-  - `论文/paper/arxiv/研究` → PAPERS.md
-  - `项目/project/代码/架构` → PROJECTS.md
-  - `为什么/决策/why/decision` → DECISIONS.md
+search_memory(query, type?, limit?)
+- query: 搜索内容
+- type: 可选（history/knowledge/decisions/projects）
+- limit: 返回数量，默认5
 
-## View Memory Status
-
-When users ask about their current memory status (e.g., "我现在记住了什么？", "查看记忆现状"), use the `exec` tool to run the CLI command:
-
-```bash
-nanobot memory status
-```
-
-For viewing a specific file:
-```bash
-nanobot memory view profile
-```
-
-For searching memory content:
-```bash
-nanobot memory search "RAG"
-nanobot memory search "论文"
-```
-
-Parse the command output and summarize the results naturally for the user.
-
-## Search Past Events
-
-```bash
-grep -i "keyword" memory/HISTORY.md
-```
-
-Use the `exec` tool to run grep. Combine patterns: `grep -iE "meeting|deadline" memory/HISTORY.md`
-
-## When to Update Memory
-
-Update memory files directly using `edit_file` or `write_file`:
-
-- **PROFILE.md**: User preferences, research direction, tools used
-- **PROJECTS.md**: Project architecture, tech decisions, progress
-- **PAPERS.md**: Paper summaries, key findings, citations
-- **DECISIONS.md**: Why you chose A over B, trade-offs considered
-
-## Auto-consolidation
-
-Old conversations are automatically processed via the `save_memory` tool:
-- History entry is appended to HISTORY.md
-- Incremental operations update specific files (append/update_section/replace)
-- You don't need to manage this manually.

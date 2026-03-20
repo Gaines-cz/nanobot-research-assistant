@@ -18,6 +18,7 @@ from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.memory import SearchMemoryTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.rag import SearchKnowledgeTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -51,7 +52,7 @@ class ConsolidationTrigger:
 
     # 默认配置
     DEFAULT_WINDOW_THRESHOLD = 100
-    DEFAULT_PAUSE_THRESHOLD_SECONDS = 300  # 5 分钟
+    DEFAULT_PAUSE_THRESHOLD_SECONDS = 24*3600  # 12小时
     DEFAULT_PAUSE_MIN_MESSAGES = 10
     DEFAULT_IMPORTANT_KEYWORDS = [
         "决定", "decision", "结论", "conclusion",
@@ -204,7 +205,7 @@ class AgentLoop:
         consolidation_pause_min_messages: int = ConsolidationTrigger.DEFAULT_PAUSE_MIN_MESSAGES,
         consolidation_important_check_window: int = ConsolidationTrigger.DEFAULT_IMPORTANT_CHECK_WINDOW,
         consolidation_important_min_messages: int = ConsolidationTrigger.DEFAULT_IMPORTANT_MIN_MESSAGES,
-        consolidation_timeout_seconds: int = 90,
+        consolidation_timeout_seconds: int = 300,  # 5 minutes
     ):
         from nanobot.config.schema import ExecToolConfig, RAGConfig, ToolsConfig
         self.bus = bus
@@ -334,6 +335,10 @@ class AgentLoop:
                 self._retrieve_tool = None
         else:
             self._retrieve_tool = None
+
+        # Register memory tools
+        embedding_model = self.rag_config.embedding_model if self.rag_config.enabled else "BAAI/bge-m3"
+        self.tools.register(SearchMemoryTool(workspace=self.workspace, embedding_model=embedding_model))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers with exponential backoff."""
@@ -676,7 +681,7 @@ class AgentLoop:
                     if snapshot:
                         temp = Session(key=session.key)
                         temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
+                        if not await self._consolidate_memory(temp):
                             return OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
                                 content="Memory archival failed, session not cleared. Please try again.",
@@ -718,6 +723,8 @@ class AgentLoop:
                     async with asyncio.timeout(self.consolidation_timeout_seconds):
                         async with lock:
                             await self._consolidate_memory(session)
+                    # Save session after successful consolidation
+                    self.sessions.save(session)
                     logger.info("Memory consolidation completed for session {}", session.key)
                 except asyncio.TimeoutError:
                     logger.error("Memory consolidation timed out after {}s for session {}",
@@ -801,34 +808,14 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    async def _consolidate_memory(self, session: Session, archive_all: bool = False) -> bool:
+    async def _consolidate_memory(self, session: Session) -> bool:
         """
-        Delegate to MemoryStore.consolidate() with RAG-based strategy.
+        Delegate to MemoryStore.consolidate().
 
         Returns True on success, False on failure.
         """
-        # Try to use RAG-based consolidation if RAG tool is available
-        if self._retrieve_tool is not None:
-            try:
-                # Ensure RAG tool is initialized (doc_store property handles this)
-                rag_store = self._retrieve_tool.doc_store
-
-                if rag_store is not None:
-                    # Update the memory store's rag_store reference for RAG-based consolidation
-                    self._memory_store._rag_store = rag_store
-                    return await self._memory_store.consolidate(
-                        session, self.provider, self.memory_model,
-                        archive_all=archive_all, memory_window=self.memory_window,
-                        use_rag=True,  # Use RAG-based consolidation
-                    )
-            except Exception as e:
-                logger.warning("RAG-based consolidation failed, falling back to direct: {}", e)
-
-        # Fallback to direct consolidation (without RAG search)
         return await self._memory_store.consolidate(
             session, self.provider, self.memory_model,
-            archive_all=archive_all, memory_window=self.memory_window,
-            use_rag=False,
         )
 
     async def process_direct(

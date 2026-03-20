@@ -32,12 +32,11 @@ class ContextBuilder:
         self.memory = memory_store if memory_store is not None else MemoryStore(workspace, embedding_provider)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None, query: str | None = None) -> str:
+    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills.
 
         Args:
             skill_names: Optional list of skill names to load.
-            query: Optional query for selective memory loading.
         """
         parts = []
         part_names = []
@@ -53,8 +52,8 @@ class ContextBuilder:
             parts.append(bootstrap)
             part_names.append("bootstrap")
 
-        # 3. Memory
-        memory = self.memory.get_memory_context(query)
+        # 3. Memory - PROFILE.md 预加载
+        memory = self.memory.get_memory_context()
         if memory:
             memory_part = f"# Memory\n\n{memory}"
             parts.append(memory_part)
@@ -125,12 +124,12 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Memory files: {workspace_path}/memory/
-  - PROFILE.md: User profile (preferences, research direction)
-  - PROJECTS.md: Project knowledge (tech stack, architecture)
-  - PAPERS.md: Paper notes and research findings
-  - DECISIONS.md: Decision records (why A over B)
-  - HISTORY.md: Append-only event log (grep-searchable)
+- Memory: SQLite database at {workspace_path}/memory/memory.db
+  - PROFILE.md: User profile (preferences, research direction) - file
+  - KNOWLEDGE: Knowledge and insights (papers, blogs, experiences) - SQLite
+  - DECISIONS: Decision records (why A over B, results, lessons) - SQLite
+  - PROJECTS: Project knowledge (tech stack, architecture, tasks) - SQLite
+  - HISTORY: Append-only event log - SQLite
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 ## nanobot Guidelines
@@ -204,7 +203,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             chat_id: Optional chat ID for runtime context.
         """
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names, query=current_message)},
+            {"role": "system", "content": self.build_system_prompt(skill_names)},
             *history,
             {"role": "user", "content": self._build_runtime_context(channel, chat_id)},
             {"role": "user", "content": self._build_user_content(current_message, media)},
