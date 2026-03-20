@@ -55,7 +55,7 @@ class ConsolidationTrigger:
     DEFAULT_PAUSE_MIN_MESSAGES = 10
     DEFAULT_IMPORTANT_KEYWORDS = [
         "决定", "decision", "结论", "conclusion",
-        "todo", "任务", "task", "计划", "plan",
+        "任务", "task", "计划", "plan",
         "项目", "project", "架构", "architecture",
         "记住", "remember", "note", "笔记",
         # 新增：偏好表达关键词
