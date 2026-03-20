@@ -27,7 +27,7 @@ class MemoryFile(Enum):
     PROJECTS = "PROJECTS.md"
     PAPERS = "PAPERS.md"
     DECISIONS = "DECISIONS.md"
-    TODOS = "TODOS.md"
+    # TODOS removed - tasks now in PROJECTS.md
     HISTORY = "HISTORY.md"
 
 
