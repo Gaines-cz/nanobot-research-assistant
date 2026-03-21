@@ -206,8 +206,6 @@ class AgentDefaults(Base):
 
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
-    memory_model: str | None = None  # Optional: separate model for memory consolidation
-    subagent_model: str | None = None  # Optional: separate model for subagents
     provider: str = "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     max_tokens: int = 8192
     temperature: float = 0.1

@@ -185,8 +185,6 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
-        memory_model: str | None = None,  # Optional: separate model for memory consolidation
-        subagent_model: str | None = None,  # Optional: separate model for subagents
         max_iterations: int = 40,
         temperature: float = 0.1,
         max_tokens: int = 4096,
@@ -213,10 +211,6 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
-        # memory_model defaults to model if not specified
-        self.memory_model = memory_model or self.model
-        # subagent_model defaults to model if not specified
-        self.subagent_model = subagent_model or self.model
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -250,7 +244,7 @@ class AgentLoop:
             provider=provider,
             workspace=workspace,
             bus=bus,
-            model=self.subagent_model,
+            model=self.model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             serper_api_key=serper_api_key,
@@ -815,7 +809,7 @@ class AgentLoop:
         Returns True on success, False on failure.
         """
         return await self._memory_store.consolidate(
-            session, self.provider, self.memory_model,
+            session, self.provider, self.model,
         )
 
     async def process_direct(

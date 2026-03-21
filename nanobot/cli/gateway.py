@@ -46,8 +46,6 @@ def gateway(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
-        memory_model=config.agents.defaults.memory_model,
-        subagent_model=config.agents.defaults.subagent_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
