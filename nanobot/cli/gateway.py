@@ -13,6 +13,7 @@ console = Console()
 def gateway(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    dashboard: bool = typer.Option(False, "--dashboard", help="Launch monitoring dashboard"),
 ):
     """Start the nanobot gateway."""
     from nanobot.agent.loop import AgentLoop
@@ -150,6 +151,14 @@ def gateway(
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
+
+    # Launch dashboard if requested
+    if dashboard:
+        import threading
+
+        from nanobot.cli.dashboard import launch_dashboard
+        t = threading.Thread(target=launch_dashboard, daemon=True)
+        t.start()
 
     async def run():
         try:

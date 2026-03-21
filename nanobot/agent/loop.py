@@ -15,6 +15,12 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.monitor import (
+    EventType,
+    TraceContext,
+    _current_session_key,
+    _current_trace_id,
+)
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -459,13 +465,21 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
+            # === LLM_CALL 埋点 ===
+            with TraceContext(EventType.LLM_CALL) as ctx:
+                ctx.metadata["model"] = self.model
+                ctx.metadata["iteration"] = iteration
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                if response.usage:
+                    ctx.metadata["prompt_tokens"] = response.usage.get("prompt_tokens", 0)
+                    ctx.metadata["completion_tokens"] = response.usage.get("completion_tokens", 0)
+                    ctx.metadata["total_tokens"] = response.usage.get("total_tokens", 0)
 
             if response.has_tool_calls:
                 if on_progress:
@@ -492,9 +506,12 @@ class AgentLoop:
 
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    # === TOOL_CALL 埋点 ===
+                    with TraceContext(EventType.TOOL_CALL) as tctx:
+                        tctx.metadata["tool_name"] = tool_call.name
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -643,17 +660,27 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history(max_messages=self.memory_window)
-            messages = self.context.build_messages(
-                history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
-            )
-            if self._retrieve_tool:
-                self._retrieve_tool._last_results = None
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
-            self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
+
+            # === 设置监控上下文（system 消息） ===
+            session_key_token = _current_session_key.set(session.key)
+            trace_token = _current_trace_id.set("")
+
+            try:
+                self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+                history = session.get_history(max_messages=self.memory_window)
+                messages = self.context.build_messages(
+                    history=history,
+                    current_message=msg.content, channel=channel, chat_id=chat_id,
+                )
+                if self._retrieve_tool:
+                    self._retrieve_tool._last_results = None
+                final_content, _, all_msgs = await self._run_agent_loop(messages)
+                self._save_turn(session, all_msgs, 1 + len(history))
+                self.sessions.save(session)
+            finally:
+                _current_session_key.reset(session_key_token)
+                _current_trace_id.reset(trace_token)
+
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -663,9 +690,14 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
+        # === 设置监控上下文 ===
+        session_key_token = _current_session_key.set(session.key)
+        trace_token = _current_trace_id.set("")  # 重置，确保 TraceContext 创建新ID
+
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
+            # /new 不走 SESSION_TURN，但仍需要清理 ContextVar
             lock = self._get_consolidation_lock(session.key)
             async with self._consolidating_set_lock:
                 self._consolidating.add(session.key)
@@ -676,12 +708,16 @@ class AgentLoop:
                         temp = Session(key=session.key)
                         temp.messages = list(snapshot)
                         if not await self._consolidate_memory(temp):
+                            _current_session_key.reset(session_key_token)
+                            _current_trace_id.reset(trace_token)
                             return OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
                                 content="Memory archival failed, session not cleared. Please try again.",
                             )
             except Exception:
                 logger.exception("/new archival failed for {}", session.key)
+                _current_session_key.reset(session_key_token)
+                _current_trace_id.reset(trace_token)
                 return OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Memory archival failed, session not cleared. Please try again.",
@@ -694,91 +730,106 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            _current_session_key.reset(session_key_token)
+            _current_trace_id.reset(trace_token)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
+            _current_session_key.reset(session_key_token)
+            _current_trace_id.reset(trace_token)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
-        trigger_consolidation = False
-        async with self._consolidating_set_lock:
-            if session.key not in self._consolidating:
-                should_trigger, reason = self._consolidation_trigger.should_trigger(session)
-                if should_trigger:
-                    logger.debug("Consolidation trigger: {}", reason)
-                    self._consolidating.add(session.key)
-                    trigger_consolidation = True
+        # === SESSION_TURN 埋点 ===
+        try:
+            with TraceContext(EventType.SESSION_TURN) as ctx:
+                ctx.metadata["msg_preview"] = msg.content[:50] if msg.content else ""
 
-        if trigger_consolidation:
-            lock = self._get_consolidation_lock(session.key)
+                trigger_consolidation = False
+                async with self._consolidating_set_lock:
+                    if session.key not in self._consolidating:
+                        should_trigger, reason = self._consolidation_trigger.should_trigger(session)
+                        if should_trigger:
+                            logger.debug("Consolidation trigger: {}", reason)
+                            self._consolidating.add(session.key)
+                            trigger_consolidation = True
 
-            async def _consolidate_and_unlock():
-                try:
-                    async with asyncio.timeout(self.consolidation_timeout_seconds):
-                        async with lock:
-                            await self._consolidate_memory(session)
-                    # Save session after successful consolidation
-                    self.sessions.save(session)
-                    logger.info("Memory consolidation completed for session {}", session.key)
-                except asyncio.TimeoutError:
-                    logger.error("Memory consolidation timed out after {}s for session {}",
-                                 self.consolidation_timeout_seconds, session.key)
-                except Exception as e:
-                    logger.error("Memory consolidation failed for session {}: {}",
-                                 session.key, e, exc_info=True)
-                finally:
-                    async with self._consolidating_set_lock:
-                        self._consolidating.discard(session.key)
-                    self._prune_consolidation_lock(session.key, lock)
+                if trigger_consolidation:
+                    lock = self._get_consolidation_lock(session.key)
 
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            _task.add_done_callback(lambda task: self._consolidation_tasks.discard(task))
-            self._consolidation_tasks.add(_task)
+                    async def _consolidate_and_unlock():
+                        # MEMORY_CONSOLIDATE 埋点
+                        with TraceContext(EventType.MEMORY_CONSOLIDATE):
+                            try:
+                                async with asyncio.timeout(self.consolidation_timeout_seconds):
+                                    async with lock:
+                                        await self._consolidate_memory(session)
+                                # Save session after successful consolidation
+                                self.sessions.save(session)
+                                logger.info("Memory consolidation completed for session {}", session.key)
+                            except asyncio.TimeoutError:
+                                logger.error("Memory consolidation timed out after {}s for session {}",
+                                             self.consolidation_timeout_seconds, session.key)
+                            except Exception as e:
+                                logger.error("Memory consolidation failed for session {}: {}",
+                                             session.key, e, exc_info=True)
+                            finally:
+                                async with self._consolidating_set_lock:
+                                    self._consolidating.discard(session.key)
+                                self._prune_consolidation_lock(session.key, lock)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
+                    _task = asyncio.create_task(_consolidate_and_unlock())
+                    _task.add_done_callback(lambda task: self._consolidation_tasks.discard(task))
+                    self._consolidation_tasks.add(_task)
 
-        history = session.get_history(max_messages=self.memory_window)
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
-        )
+                self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+                if message_tool := self.tools.get("message"):
+                    if isinstance(message_tool, MessageTool):
+                        message_tool.start_turn()
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
+                history = session.get_history(max_messages=self.memory_window)
+                initial_messages = self.context.build_messages(
+                    history=history,
+                    current_message=msg.content,
+                    media=msg.media if msg.media else None,
+                    channel=msg.channel, chat_id=msg.chat_id,
+                )
 
-        if self._retrieve_tool:
-            self._retrieve_tool._last_results = None
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-        )
+                async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+                    meta = dict(msg.metadata or {})
+                    meta["_progress"] = True
+                    meta["_tool_hint"] = tool_hint
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+                    ))
 
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+                if self._retrieve_tool:
+                    self._retrieve_tool._last_results = None
+                final_content, _, all_msgs = await self._run_agent_loop(
+                    initial_messages, on_progress=on_progress or _bus_progress,
+                )
 
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+                if final_content is None:
+                    final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
+                preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+                logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-                return None
+                self._save_turn(session, all_msgs, 1 + len(history))
+                self.sessions.save(session)
 
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
-        )
+                if message_tool := self.tools.get("message"):
+                    if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+                        return None
+
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content=final_content,
+                    metadata=msg.metadata or {},
+                )
+        finally:
+            # 清理 ContextVar
+            _current_session_key.reset(session_key_token)
+            _current_trace_id.reset(trace_token)
 
     _TOOL_RESULT_MAX_CHARS = 500
 
