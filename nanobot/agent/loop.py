@@ -455,12 +455,13 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
+    ) -> tuple[str | None, list[str], list[dict], bool]:
+        """Run the agent iteration loop. Returns (final_content, tools_used, messages, last_response_had_tool_calls)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        last_response_had_tool_calls = False
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -481,6 +482,7 @@ class AgentLoop:
                     ctx.metadata["completion_tokens"] = response.usage.get("completion_tokens", 0)
                     ctx.metadata["total_tokens"] = response.usage.get("total_tokens", 0)
 
+            last_response_had_tool_calls = bool(response.has_tool_calls)
             if response.has_tool_calls:
                 if on_progress:
                     clean = self._strip_think(response.content)
@@ -530,7 +532,7 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
-        return final_content, tools_used, messages
+        return final_content, tools_used, messages, last_response_had_tool_calls
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -674,15 +676,18 @@ class AgentLoop:
                 )
                 if self._retrieve_tool:
                     self._retrieve_tool._last_results = None
-                final_content, _, all_msgs = await self._run_agent_loop(messages)
+                final_content, _, all_msgs, last_response_had_tool_calls = await self._run_agent_loop(messages)
                 self._save_turn(session, all_msgs, 1 + len(history))
                 self.sessions.save(session)
             finally:
                 _current_session_key.reset(session_key_token)
                 _current_trace_id.reset(trace_token)
 
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+            return OutboundMessage(
+                channel=channel, chat_id=chat_id,
+                content=final_content or "Background task completed.",
+                metadata={"_has_tool_call": last_response_had_tool_calls},
+            )
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -805,7 +810,7 @@ class AgentLoop:
 
                 if self._retrieve_tool:
                     self._retrieve_tool._last_results = None
-                final_content, _, all_msgs = await self._run_agent_loop(
+                final_content, _, all_msgs, last_response_had_tool_calls = await self._run_agent_loop(
                     initial_messages, on_progress=on_progress or _bus_progress,
                 )
 
@@ -824,7 +829,7 @@ class AgentLoop:
 
                 return OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-                    metadata=msg.metadata or {},
+                    metadata={**(msg.metadata or {}), "_has_tool_call": last_response_had_tool_calls},
                 )
         finally:
             # 清理 ContextVar

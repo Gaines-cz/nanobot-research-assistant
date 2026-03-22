@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,14 @@ from nanobot.config.schema import FeishuConfig
 
 try:
     import lark_oapi as lark
+    from lark_oapi.api.cardkit.v1 import (
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        CreateCardRequest,
+        CreateCardRequestBody,
+        SettingsCardRequest,
+        SettingsCardRequestBody,
+    )
     from lark_oapi.api.im.v1 import (
         CreateFileRequest,
         CreateFileRequestBody,
@@ -37,6 +46,12 @@ except ImportError:
     FEISHU_AVAILABLE = False
     lark = None
     Emoji = None
+    ContentCardElementRequest = None
+    ContentCardElementRequestBody = None
+    CreateCardRequest = None
+    CreateCardRequestBody = None
+    SettingsCardRequest = None
+    SettingsCardRequestBody = None
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -620,7 +635,7 @@ class FeishuChannel(BaseChannel):
             return False
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Feishu, including media (images/files) if present."""
+        """Send a message through Feishu, choosing streaming or normal based on content."""
         if not self._client:
             logger.warning("Feishu client not initialized")
             return
@@ -629,6 +644,7 @@ class FeishuChannel(BaseChannel):
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
 
+            # Send media first (non-streaming)
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
                     logger.warning("Media file not found: {}", file_path)
@@ -650,15 +666,203 @@ class FeishuChannel(BaseChannel):
                             receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
 
+            # Send text content - choose streaming or normal
             if msg.content and msg.content.strip():
-                card = {"config": {"wide_screen_mode": True}, "elements": self._build_card_elements(msg.content)}
-                await loop.run_in_executor(
-                    None, self._send_message_sync,
-                    receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
-                )
+                if self._should_stream(msg):
+                    await self._send_streaming(msg, receive_id_type)
+                else:
+                    await self._send_normal(msg, receive_id_type)
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
+
+    def _should_stream(self, msg: OutboundMessage) -> bool:
+        """Check if streaming should be used for this message."""
+        if not self.config.streaming:
+            logger.debug("Feishu streaming disabled in config")
+            return False
+        # Currently does not support streaming with tool_call
+        if msg.metadata.get("_has_tool_call"):
+            logger.debug("Feishu streaming disabled: message has tool_call")
+            return False
+        logger.debug("Feishu streaming enabled for message, content length: {}", len(msg.content or ""))
+        return True
+
+    async def _send_normal(self, msg: OutboundMessage, receive_id_type: str) -> None:
+        """Send message with normal interactive card."""
+        loop = asyncio.get_running_loop()
+        card = {"config": {"wide_screen_mode": True}, "elements": self._build_card_elements(msg.content)}
+        await loop.run_in_executor(
+            None, self._send_message_sync,
+            receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
+        )
+
+    async def _send_streaming(self, msg: OutboundMessage, receive_id_type: str) -> None:
+        """Send message with Feishu streaming card (typewriter effect)."""
+        logger.info("Feishu streaming: starting for chat_id={}, content_len={}", msg.chat_id, len(msg.content or ""))
+
+        # 1. Create streaming card
+        card_id = await self._create_streaming_card()
+        if not card_id:
+            logger.warning("Feishu streaming: failed to create card, falling back to normal")
+            await self._send_normal(msg, receive_id_type)
+            return
+        logger.info("Feishu streaming: card_id={} created", card_id)
+
+        # 2. Send card message to chat
+        message_id = await self._send_card_message(card_id, receive_id_type, msg.chat_id)
+        if not message_id:
+            logger.warning("Feishu streaming: failed to send card message, falling back to normal")
+            await self._send_normal(msg, receive_id_type)
+            return
+        logger.info("Feishu streaming: card message_id={} sent", message_id)
+
+        # 3. Stream update text with typewriter effect
+        logger.info("Feishu streaming: starting text stream, content_len={}", len(msg.content or ""))
+        await self._stream_update_text(card_id, msg.content)
+        logger.info("Feishu streaming: text stream completed")
+
+        # 4. Close streaming mode
+        await self._close_streaming(card_id)
+        logger.info("Feishu streaming: completed for chat_id={}", msg.chat_id)
+
+    async def _create_streaming_card(self) -> str | None:
+        """Create a streaming-enabled card, return card_id.
+
+        Creates a streaming card template via cardkit API.
+        The card_id is used to reference this card in subsequent updates.
+        """
+        if not CreateCardRequest or not CreateCardRequestBody:
+            return None
+
+        card_json = {
+            "schema": "2.0",
+            "header": {
+                "title": {"content": "AI 助手", "tag": "plain_text"},
+            },
+            "config": {
+                "streaming_mode": True,
+                "summary": {"content": "[生成中...]"},
+                "streaming_config": {
+                    "print_frequency_ms": {"default": 70},
+                    "print_step": {"default": 1},
+                    "print_strategy": "delay",
+                },
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": "", "element_id": "content_1"},
+                ],
+            },
+        }
+
+        try:
+            request = (
+                CreateCardRequest.builder()
+                .request_body(
+                    CreateCardRequestBody.builder()
+                    .type("card_json")
+                    .data(json.dumps(card_json, ensure_ascii=False))
+                    .build()
+                )
+                .build()
+            )
+            response = await self._client.cardkit.v1.card.acreate(request)
+            if response.success():
+                return response.data.card_id
+            else:
+                logger.warning("Failed to create streaming card: code={}, msg={}", response.code, response.msg)
+        except Exception as e:
+            logger.error("Error creating streaming card: {}", e)
+
+        return None
+
+    async def _send_card_message(self, card_id: str, receive_id_type: str, chat_id: str) -> str | None:
+        """Send the card message to chat, return message_id."""
+        # 发送卡片实体，引用已创建的流式卡片 card_id
+        card_content = {
+            "type": "card",
+            "data": {
+                "card_id": card_id,
+            },
+        }
+
+        try:
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type(receive_id_type)
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("interactive")
+                    .content(json.dumps(card_content, ensure_ascii=False))
+                    .build()
+                )
+                .build()
+            )
+            response = await self._client.im.v1.message.acreate(request)
+            if response.success():
+                return response.data.message_id
+            else:
+                logger.warning("Failed to send card message: code={}, msg={}", response.code, response.msg)
+        except Exception as e:
+            logger.error("Error sending card message: {}", e)
+
+        return None
+
+    async def _stream_update_text(self, card_id: str, content: str) -> None:
+        """Stream update card text with typewriter effect.
+
+        Feishu will automatically calculate the incremental part and display
+        with typewriter effect. We just need to send the full content once.
+        """
+        if not ContentCardElementRequest or not ContentCardElementRequestBody:
+            return
+
+        logger.debug("Feishu streaming: sending full content len={}", len(content))
+
+        try:
+            request = (
+                ContentCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id("content_1")
+                .request_body(
+                    ContentCardElementRequestBody.builder()
+                    .uuid(str(uuid.uuid4()))
+                    .content(content)
+                    .sequence(1)
+                    .build()
+                )
+                .build()
+            )
+            await self._client.cardkit.v1.card_element.acontent(request)
+            logger.debug("Feishu streaming: full content sent")
+        except Exception as e:
+            logger.warning("Failed to update card text: {}", e)
+
+    async def _close_streaming(self, card_id: str) -> None:
+        """Close streaming mode for the card."""
+        if not SettingsCardRequest or not SettingsCardRequestBody:
+            return
+
+        logger.debug("Feishu streaming: closing streaming for card_id={}", card_id)
+        try:
+            request = (
+                SettingsCardRequest.builder()
+                .card_id(card_id)
+                .request_body(
+                    SettingsCardRequestBody.builder()
+                    .settings(json.dumps({"config": {"streaming_mode": False}}, ensure_ascii=False))
+                    .uuid(str(uuid.uuid4()))
+                    .sequence(1)
+                    .build()
+                )
+                .build()
+            )
+            await self._client.cardkit.v1.card.asettings(request)
+            logger.debug("Feishu streaming: streaming closed for card_id={}", card_id)
+        except Exception as e:
+            logger.warning("Failed to close streaming: {}", e)
 
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """
